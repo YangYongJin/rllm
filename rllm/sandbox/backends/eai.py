@@ -65,7 +65,9 @@ def map_image(image: str) -> str:
         return image
     name = image.split("/", 1)[-1]
     repo, _, tag = name.partition(":")
-    mapped = f"{INTERNAL_REGISTRY}/r2e_{repo}:{tag}" if tag else f"{INTERNAL_REGISTRY}/r2e_{repo}"
+    # r2e2_* images carry the full EAI-compat layer (writable /testbed for the
+    # job uid, /tests + /logs stubs) — see mirror_task_image_v2.sh.
+    mapped = f"{INTERNAL_REGISTRY}/r2e2_{repo}:{tag}" if tag else f"{INTERNAL_REGISTRY}/r2e2_{repo}"
     return mapped
 
 
@@ -179,9 +181,13 @@ class EAISandbox:
             shutil.rmtree(staged)
         shutil.copytree(local_path, staged)
         rel = os.path.relpath(staged, TRANSFER_HOST_DIR)
+        # Content-copy (src/. -> dest/) so a pre-existing destination dir is
+        # populated rather than nested into (plain `cp -a src dest` would
+        # create dest/src when dest exists — e.g. the baked /tests stub).
+        dest = remote_path.rstrip("/")
         self.exec(
-            f"mkdir -p {_shquote(os.path.dirname(remote_path.rstrip('/')))} && "
-            f"cp -a {_shquote(os.path.join(TRANSFER_REMOTE_DIR, rel))} {_shquote(remote_path.rstrip('/'))}"
+            f"mkdir -p {_shquote(dest)} && "
+            f"cp -a {_shquote(os.path.join(TRANSFER_REMOTE_DIR, rel) + '/.')} {_shquote(dest + '/')}"
         )
 
     def is_alive(self) -> bool:

@@ -95,7 +95,14 @@ async def run_dataset(
     if owned_gateway:
         # Auto-tunnel for off-host sandboxes (same predicate AgentTrainer uses).
         gateway_tunnel = None if is_local_sandbox_backend(sandbox_backend) else "cloudflared"
-        gateway = EvalGatewayManager(upstream_url=base_url, model=model, tunnel=gateway_tunnel)
+        gw_kwargs: dict = {}
+        if sandbox_backend and sandbox_backend.lower() == "eai":
+            # EAI sandboxes are separate pods: 127.0.0.1 points at the sandbox
+            # itself. Bind/advertise the driver's routable pod IP instead.
+            from rllm.gateway.manager import _get_routable_ip
+
+            gw_kwargs["host"] = _get_routable_ip()
+        gateway = EvalGatewayManager(upstream_url=base_url, model=model, tunnel=gateway_tunnel, **gw_kwargs)
         gateway.start()
 
     hooks = SandboxTaskHooks(evaluation=FixedEvaluation(evaluator) if evaluator is not None else None, sandbox_backend=sandbox_backend, use_snapshot=use_snapshot)
