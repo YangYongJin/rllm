@@ -12,6 +12,8 @@ import asyncio
 import logging
 import math
 import os
+import re
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,6 +129,7 @@ def build_sft_data(config, train_data, val_data):
         resolution.source,
         last_only,
     )
+    config.data.resolved_renderer_name = resolution.name
 
     train_batch_size = config.data.get("train_batch_size", 32)
     val_batch_size = config.data.get("micro_batch_size_per_gpu", train_batch_size)
@@ -201,6 +204,24 @@ def iter_training_batches(
         yield step, epoch, batch
 
 
+def iter_training_batches_from_step(
+    *,
+    n_batches: int,
+    total_epochs: int,
+    start_step: int,
+    max_steps: int | None = None,
+):
+    """Yield the remaining plan from a completed-step (next unseen) cursor."""
+    start_epoch, start_batch = divmod(start_step, n_batches)
+    return iter_training_batches(
+        n_batches=n_batches,
+        total_epochs=total_epochs,
+        start_epoch=start_epoch,
+        start_batch=start_batch,
+        max_steps=max_steps,
+    )
+
+
 def sft_lr_multiplier(
     lr_schedule: str,
     step: int,
@@ -264,6 +285,56 @@ class SFTOptimizerSettings:
     eps: float
     weight_decay: float
     grad_clip_norm: float
+
+
+def _resume_field(resume_info, field: str, default=None):
+    if hasattr(resume_info, "get"):
+        missing = object()
+        value = resume_info.get(field, missing)
+        if value is not missing:
+            return value
+    return getattr(resume_info, field, default)
+
+
+def validate_tinker_resume_cursor(
+    resume_info,
+    *,
+    n_batches: int,
+    total_steps: int,
+) -> int:
+    """Require a complete, consistent next-unseen completed-step cursor."""
+    values: dict[str, int] = {}
+    for field in ("epoch", "batch", "step"):
+        value = _resume_field(resume_info, field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SFTConfigError(f"checkpoint loop_state.{field} must be a non-negative integer, got {value!r}.")
+        if value < 0:
+            raise SFTConfigError(f"checkpoint loop_state.{field} must be non-negative, got {value}.")
+        values[field] = value
+    expected_step = values["epoch"] * n_batches + values["batch"]
+    if values["batch"] >= n_batches or values["step"] != expected_step or values["step"] > total_steps:
+        raise SFTConfigError(
+            "Tinker checkpoint cursor is inconsistent with the resolved SFT batch plan "
+            f"(epoch={values['epoch']}, batch={values['batch']}, step={values['step']}, "
+            f"batches_per_epoch={n_batches}, total_steps={total_steps}). Use a new output directory."
+        )
+    return values["step"]
+
+
+def _is_step_boundary(
+    completed_steps: int,
+    total_steps: int,
+    *,
+    save_every: int,
+    eval_every: int,
+    has_validation: bool,
+) -> bool:
+    """Whether the one-ahead pipeline must drain at this model boundary."""
+    return (
+        completed_steps >= total_steps
+        or (has_validation and eval_every > 0 and completed_steps % eval_every == 0)
+        or (save_every > 0 and completed_steps % save_every == 0 and completed_steps < total_steps)
+    )
 
 
 def resolve_sft_optimizer_settings(optim_cfg, *, total_steps: int) -> SFTOptimizerSettings:
@@ -355,8 +426,8 @@ class TinkerSFTBackend(SFTBackend):
     def __init__(self, spec):
         super().__init__(spec)
         self._config: DictConfig | None = None
-
-    # -- contract -----------------------------------------------------------
+        self._run_leaf = f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}-{secrets.token_hex(4)}"
+        self._resume_requested = False
 
     def validate_spec(self) -> None:
         if self.spec.tokenize_method == "hf_template":
@@ -423,6 +494,24 @@ class TinkerSFTBackend(SFTBackend):
             cfg = OmegaConf.merge(cfg, OmegaConf.create({"trainer": {"default_local_dir": spec.output_dir}}))
         if spec.overrides:
             cfg = OmegaConf.merge(cfg, OmegaConf.create(spec.overrides))
+        user = OmegaConf.to_container(OmegaConf.create(spec.overrides), resolve=False) if spec.overrides else {}
+        user_trainer = user.get("trainer") if isinstance(user, dict) else None
+        explicit_override = isinstance(user_trainer, dict) and user_trainer.get("default_local_dir") is not None
+        self._resume_requested = bool(spec.output_dir) or explicit_override
+        if not self._resume_requested:
+            experiment = (
+                re.sub(
+                    r"[^A-Za-z0-9._-]+",
+                    "-",
+                    str(cfg.trainer.get("experiment_name") or "default"),
+                ).strip("-._")
+                or "default"
+            )
+            cfg.trainer.default_local_dir = os.path.join(
+                str(cfg.trainer.default_local_dir),
+                experiment,
+                self._run_leaf,
+            )
         self._config = cfg
         return cfg
 
@@ -466,12 +555,11 @@ class TinkerSFTBackend(SFTBackend):
         from rllm.utils.tracking import Tracking
 
         config = self._config
+        if not self._resume_requested and os.path.exists(config.trainer.default_local_dir):
+            raise SFTConfigError("The generated Tinker run directory already exists; create a new backend instance so a fresh isolated directory can be selected.")
         os.makedirs(config.trainer.default_local_dir, exist_ok=True)
         tokenizer, train_dataset, val_dataset = build_sft_data(config, self.spec.train_dataset, self.spec.val_dataset)
 
-        resume_info = checkpoint_utils.get_last_checkpoint(config.trainer.default_local_dir)
-        start_epoch = resume_info.get("epoch", 0) if resume_info else 0
-        start_batch = resume_info.get("batch", 0) if resume_info else 0
         n_batches = len(train_dataset)
         total_epochs = config.trainer.get("total_epochs", 1)
         max_steps = config.trainer.get("max_steps")
@@ -480,6 +568,17 @@ class TinkerSFTBackend(SFTBackend):
         optimizer = resolve_sft_optimizer_settings(config.get("optim", {}), total_steps=total_steps)
         save_every = config.trainer.get("save_freq", 20)
         eval_every = config.trainer.get("test_freq", 10)
+
+        resume_info = checkpoint_utils.get_last_checkpoint(config.trainer.default_local_dir) if self._resume_requested else None
+        start_step = (
+            validate_tinker_resume_cursor(
+                resume_info,
+                n_batches=n_batches,
+                total_steps=total_steps,
+            )
+            if resume_info is not None
+            else 0
+        )
 
         service_client = tinker.ServiceClient(base_url=config.get("tinker_base_url", None))
 
@@ -496,9 +595,20 @@ class TinkerSFTBackend(SFTBackend):
         # Wrap the loop so tracking_logger.finish() runs even on failure: the 'ui'
         # backend tees stdout/stderr and holds an open session until finish().
         try:
+            user_metadata: dict[str, str] = {}
+            checkpoint_utils.add_renderer_name_to_user_metadata(
+                user_metadata,
+                config.data.get("resolved_renderer_name"),
+            )
             if resume_info:
                 logger.info(f"Resuming from checkpoint: {resume_info}")
-                training_client = await service_client.create_training_client_from_state_async(resume_info["state_path"])
+                state_path = _resume_field(resume_info, "state_path")
+                if not isinstance(state_path, str) or not state_path:
+                    raise SFTConfigError("Tinker checkpoint is missing a provider state_path; use a new output directory.")
+                training_client = await service_client.create_training_client_from_state_with_optimizer_async(
+                    state_path,
+                    user_metadata=user_metadata,
+                )
             else:
                 logger.info("Starting training from scratch")
                 training_client = await service_client.create_lora_training_client_async(
@@ -507,6 +617,7 @@ class TinkerSFTBackend(SFTBackend):
                     train_unembed=OmegaConf.select(config, "model.train_unembed", default=True),
                     train_attn=OmegaConf.select(config, "model.train_attn", default=True),
                     train_mlp=OmegaConf.select(config, "model.train_mlp", default=True),
+                    user_metadata=user_metadata,
                 )
             logger.info(f"Training for {n_batches} batches x {total_epochs} epochs = {total_steps} steps")
 
@@ -514,15 +625,21 @@ class TinkerSFTBackend(SFTBackend):
                 0,
                 eval_every=eval_every,
                 has_validation=val_dataset is not None,
-                include_initial=start_epoch == 0 and start_batch == 0,
+                include_initial=start_step == 0,
             ):
                 initial_metrics: dict[str, Any] = {}
                 with timed("validation", initial_metrics):
                     initial_metrics.update(await self._validate(training_client, val_dataset, compute_mean_nll))
                 tracking_logger.log(data=initial_metrics, step=0)
 
-            async def submit_batch(epoch_idx: int, batch_idx: int) -> _SubmittedBatch:
-                step = epoch_idx * n_batches + batch_idx
+            current_epoch: int | None = None
+
+            async def submit_batch(step: int, epoch_idx: int, batch_idx: int) -> _SubmittedBatch:
+                nonlocal current_epoch
+                if epoch_idx != current_epoch:
+                    logger.info(f"Starting epoch {epoch_idx}")
+                    train_dataset.set_epoch(seed=epoch_idx)
+                    current_epoch = epoch_idx
                 batch_start_time = time.time()
                 metrics: dict[str, Any] = {"epoch": epoch_idx, "progress": step / progress_denominator}
                 learning_rate = optimizer.learning_rate * sft_lr_multiplier(
@@ -549,20 +666,19 @@ class TinkerSFTBackend(SFTBackend):
 
                 fwd_bwd_future = await training_client.forward_backward_async(data, loss_fn="cross_entropy")
                 optim_step_future = await training_client.optim_step_async(adam_params)
-                return _SubmittedBatch(fwd_bwd_future, optim_step_future, metrics, data, step, epoch_idx, batch_idx, batch_start_time)
+                return _SubmittedBatch(
+                    fwd_bwd_future=fwd_bwd_future,
+                    optim_step_future=optim_step_future,
+                    metrics=metrics,
+                    data=data,
+                    step=step,
+                    epoch_idx=epoch_idx,
+                    batch_idx=batch_idx,
+                    batch_start_time=batch_start_time,
+                )
 
             async def finish_batch(submitted: _SubmittedBatch) -> None:
                 metrics = submitted.metrics
-                metrics["progress"] = min((submitted.step + 1) / progress_denominator, 1.0)
-                if save_every > 0 and submitted.step % save_every == 0 and submitted.step > 0:
-                    with timed("save_checkpoint", metrics):
-                        await checkpoint_utils.save_checkpoint_async(
-                            training_client=training_client,
-                            name=f"{submitted.step:06d}",
-                            log_path=config.trainer.default_local_dir,
-                            loop_state={"epoch": submitted.epoch_idx, "batch": submitted.batch_idx},
-                            kind="both",
-                        )
                 with timed("step", metrics):
                     fwd_bwd_result = await submitted.fwd_bwd_future.result_async()
                     await submitted.optim_step_future.result_async()
@@ -579,6 +695,7 @@ class TinkerSFTBackend(SFTBackend):
                 metrics["time/total"] = time.time() - submitted.batch_start_time
 
                 completed_steps = submitted.step + 1
+                metrics["progress"] = min(completed_steps / progress_denominator, 1.0)
                 if should_validate_step(
                     completed_steps,
                     eval_every=eval_every,
@@ -588,37 +705,51 @@ class TinkerSFTBackend(SFTBackend):
                         val_metrics = await self._validate(training_client, val_dataset, compute_mean_nll)
                     metrics.update(val_metrics)
 
+                if save_every > 0 and completed_steps % save_every == 0 and completed_steps < total_steps:
+                    next_epoch, next_batch = divmod(completed_steps, n_batches)
+                    with timed("save_checkpoint", metrics):
+                        await checkpoint_utils.save_checkpoint_async(
+                            training_client=training_client,
+                            name=f"{completed_steps:06d}",
+                            log_path=config.trainer.default_local_dir,
+                            loop_state={
+                                "epoch": next_epoch,
+                                "batch": next_batch,
+                                "step": completed_steps,
+                            },
+                            kind="both",
+                        )
+
                 tracking_logger.log(data=metrics, step=completed_steps)
                 logger.info(f"Step {completed_steps}: train_nll={train_nll:.4f}, lr={metrics['learning_rate']:.2e}")
 
             pending: _SubmittedBatch | None = None
-            current_epoch: int | None = None
-            for _step, epoch_idx, batch_idx in iter_training_batches(
+            for step, epoch_idx, batch_idx in iter_training_batches_from_step(
                 n_batches=n_batches,
                 total_epochs=total_epochs,
-                start_epoch=start_epoch,
-                start_batch=start_batch,
+                start_step=start_step,
                 max_steps=max_steps,
             ):
-                if epoch_idx != current_epoch:
-                    logger.info(f"Starting epoch {epoch_idx}")
-                    train_dataset.set_epoch(seed=epoch_idx)
-                    current_epoch = epoch_idx
-                if pending is not None and should_validate_step(
+                if pending is None:
+                    pending = await submit_batch(step, epoch_idx, batch_idx)
+                    continue
+
+                if _is_step_boundary(
                     pending.step + 1,
+                    total_steps,
+                    save_every=save_every,
                     eval_every=eval_every,
                     has_validation=val_dataset is not None,
                 ):
                     await finish_batch(pending)
-                    pending = None
-                submitted = await submit_batch(epoch_idx, batch_idx)
-                if pending is not None:
+                    pending = await submit_batch(step, epoch_idx, batch_idx)
+                else:
+                    following = await submit_batch(step, epoch_idx, batch_idx)
                     await finish_batch(pending)
-                pending = submitted
+                    pending = following
             if pending is not None:
                 await finish_batch(pending)
 
-            start_step = start_epoch * n_batches + start_batch
             if start_step < total_steps:
                 final_epoch, final_batch = divmod(total_steps, n_batches)
                 await checkpoint_utils.save_checkpoint_async(
@@ -626,7 +757,12 @@ class TinkerSFTBackend(SFTBackend):
                     name="final",
                     log_path=config.trainer.default_local_dir,
                     kind="both",
-                    loop_state={"epoch": final_epoch, "batch": final_batch},
+                    loop_state={
+                        "epoch": final_epoch,
+                        "batch": final_batch,
+                        "step": total_steps,
+                        "final": True,
+                    },
                 )
             else:
                 logger.info("Training was already complete; nothing to do")

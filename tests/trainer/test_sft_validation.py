@@ -263,6 +263,9 @@ class _LoopDataset:
     def preflight(self, **_kwargs):
         pass
 
+    def data_cursor_for_step(self, completed_steps):
+        return completed_steps
+
 
 class _LoopTinkerClient:
     def __init__(self, events):
