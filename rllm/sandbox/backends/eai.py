@@ -132,10 +132,15 @@ class EAISandbox:
         raise RuntimeError(f"EAISandbox {self.name}: job {self.job_id} not RUNNING after {timeout}s")
 
     def exec(self, command: str, timeout: float | None = None, user: str | None = None) -> str:
-        """Execute a command in the sandbox job. ``user`` is ignored (fixed uid)."""
+        """Execute a command in the sandbox job. ``user`` is ignored (fixed uid).
+
+        Every command runs with ``HOME=/tmp``: the image's real HOME (``/root``)
+        is not writable by the job uid, and harness installs (`uv tool install`),
+        agent config files, and git state all need a writable home.
+        """
         if user is not None:
             logger.debug("EAISandbox %s: ignoring user=%r (jobs run as a fixed uid)", self.name, user)
-        remote = command
+        remote = "export HOME=/tmp; " + command
         if timeout is not None:
             remote = f"timeout {int(timeout)} bash -c {_shquote(command)}"
         proc = _eai(
