@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 
 _status = Console()
 
-# Sandbox backends that share network with the gateway host.
-LOCAL_SANDBOX_BACKENDS: frozenset[str] = frozenset({"docker", "local", "apple-container"})
+# Sandbox backends that share network with the gateway host. "eai" sandboxes
+# are cluster jobs on the same pod network as the gateway host — the gateway's
+# routable-IP default is directly reachable, no tunnel needed.
+LOCAL_SANDBOX_BACKENDS: frozenset[str] = frozenset({"docker", "local", "apple-container", "eai"})
 
 
 def is_local_sandbox_backend(name: str | None) -> bool:
