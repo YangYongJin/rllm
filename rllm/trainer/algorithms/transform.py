@@ -115,6 +115,13 @@ def _build_trajectory_groups(episodes: list[Episode], compact_filtering_config: 
     trajectories_by_name: dict[str, list[Trajectory]] = defaultdict(list)
     metadata_by_name: dict[str, list[dict]] = defaultdict(list)
 
+    # Rollout-control: stopped non-audit episodes have unknown terminal reward
+    # and must not enter the update (never as zero-reward). Inert unless the
+    # continuation controller is enabled. See algorithms/controller_filter.py.
+    from rllm.trainer.algorithms.controller_filter import controller_episode_filter
+
+    episodes, _controller_metrics = controller_episode_filter(episodes)
+
     for episode in episodes:
         termination_reason = episode.termination_reason or TerminationReason.UNKNOWN
         # skip episode if it should be masked by compact filtering
