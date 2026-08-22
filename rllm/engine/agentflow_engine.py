@@ -168,6 +168,22 @@ def enrich_episode_with_traces(
             )
             training_steps = training_steps[:n_agent_steps]
 
+    # Same rationale for flows that record no Steps at all (CLI harnesses:
+    # steps are built wholesale from traces): an occasional token-less trace
+    # (prompt hit max_model_len -> 400, disconnect mid-call) must not burn the
+    # rollout. Drop malformed traces; keep the hard error below for the
+    # all-malformed case, which indicates real misconfiguration.
+    if not agent_populates_steps:
+        malformed = [s for s in training_steps if not s.model_output.prompt_ids or not s.model_output.completion_ids]
+        if malformed and len(malformed) < len(training_steps):
+            logger.warning(
+                "[%s] dropping %d malformed trace(s) of %d (steps built from traces)",
+                uid,
+                len(malformed),
+                len(training_steps),
+            )
+            training_steps = [s for s in training_steps if s.model_output.prompt_ids and s.model_output.completion_ids]
+
     empty_prompt = sum(1 for s in training_steps if not s.model_output.prompt_ids)
     empty_compl = sum(1 for s in training_steps if not s.model_output.completion_ids)
     # Only enforce step-count parity when the agent actually populates steps.
