@@ -88,6 +88,9 @@ class ReverseProxy:
         cumulative_token_mode: bool = False,
         renderer: Any = None,
     ) -> None:
+        from rllm_model_gateway.continuation import controller_from_env
+
+        self._controller = controller_from_env()
         self.router = router
         self.store = store
         self.strip_vllm = strip_vllm
@@ -146,6 +149,14 @@ class ReverseProxy:
             request_body = {}
 
         is_stream = request_body.get("stream", False)
+
+        # Rollout-control: one session request = one turn. The controller may
+        # end the rollout by answering with the harness's own exit action
+        # (see continuation.py); inert unless RLLM_CONTROLLER_ENABLE=1.
+        if self._controller is not None and session_id and request.url.path.endswith("/chat/completions"):
+            stop_body = self._controller.on_turn(session_id, request_body)
+            if stop_body is not None:
+                return Response(content=json.dumps(stop_body), media_type="application/json")
 
         # Cumulative token mode interception: if enabled and past first turn,
         # rewrite to /v1/completions with pre-tokenized prompt to avoid drift.
