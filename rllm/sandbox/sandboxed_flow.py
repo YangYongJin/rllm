@@ -22,7 +22,7 @@ class SandboxedAgentFlow(ABC):
     """Base class for agents that run against a sandboxed execution environment.
 
     The sandbox backend is pluggable via ``sandbox_backend``:
-    ``"docker"`` | ``"local"`` | ``"modal"`` | ``"daytona"``.
+    ``"docker"`` | ``"local"`` | ``"modal"`` | ``"daytona"`` | ``"eai"``.
 
     Subclasses implement :meth:`run` and may override :meth:`get_image`
     for per-task images.
@@ -87,8 +87,12 @@ def create_sandbox(backend: str, name: str, image: str, **kwargs) -> Sandbox:
         from rllm.sandbox.backends.daytona import DaytonaSandbox
 
         return DaytonaSandbox(name=name, image=image, **kwargs)
+    elif backend == "eai":
+        from rllm.sandbox.backends.eai import EAISandbox
+
+        return EAISandbox(name=name, image=image, **kwargs)
     else:
-        raise ValueError(f"Unknown sandbox backend: {backend}. Available: docker, local, modal, daytona")
+        raise ValueError(f"Unknown sandbox backend: {backend}. Available: docker, local, modal, daytona, eai")
 
 
 def build_snapshot(backend: str, task: Task, key: str, prior_ref: str | None = None, *, force: bool = False, install_script: str = "") -> str | None:
