@@ -49,6 +49,7 @@ def controller_from_env() -> "ContinuationController | None":
         mode=os.environ.get("RLLM_CONTROLLER_MODE", "random"),
         head_path=os.environ.get("RLLM_CONTROLLER_HEAD") or None,
         lam=float(os.environ.get("RLLM_CONTROLLER_LAMBDA", "0.3")),
+        beta=float(os.environ.get("RLLM_CONTROLLER_BETA", "0.0")),
         temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
         p_min=float(os.environ.get("RLLM_CONTROLLER_P_MIN", "0.05")),
         p_stop=float(os.environ.get("RLLM_CONTROLLER_P_STOP", "0.15")),
@@ -65,6 +66,7 @@ class ContinuationController:
         mode: str = "random",
         head_path: str | None = None,
         lam: float = 0.3,
+        beta: float = 0.0,
         temperature: float = 0.15,
         p_min: float = 0.05,
         p_stop: float = 0.15,
@@ -75,7 +77,7 @@ class ContinuationController:
     ) -> None:
         assert mode in ("random", "learned"), f"unsupported controller mode: {mode}"
         self.mode = mode
-        self.lam, self.temperature, self.p_min = lam, temperature, p_min
+        self.lam, self.beta, self.temperature, self.p_min = lam, beta, temperature, p_min
         self._head = None
         if mode == "learned":
             with open(head_path) as f:
@@ -124,7 +126,10 @@ class ContinuationController:
         v_c = p_hat * (1.0 - b) + (1.0 - p_hat) * b
         mean_turns = (sum(self._turn_costs) / len(self._turn_costs)) if self._turn_costs else 12.0
         remaining = max(0.0, mean_turns - st["turn"]) / max(mean_turns, 1.0)
-        z2 = (v_c - self.lam * remaining) / self.temperature
+        # beta re-centers the per-turn hazard: s_t compounds across turns, so
+        # typical prefixes must sit near s_t~0.9+, not ~0.5, for sane trajectory-
+        # level stop rates. beta>0 shifts the operating point accordingly.
+        z2 = (v_c - self.lam * remaining + self.beta) / self.temperature
         z2 = max(-30.0, min(30.0, z2))
         return self.p_min + (1.0 - self.p_min) * (1.0 / (1.0 + math.exp(-z2)))
 
