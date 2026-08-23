@@ -155,10 +155,23 @@ class EAISandbox:
         remote = wrapped
         if timeout is not None:
             remote = f"timeout {int(timeout)} bash -c {_shquote(wrapped)}"
-        proc = _eai(
-            "job", "exec", self.job_id, "--", "bash", "-c", remote,
-            timeout=(timeout + 60) if timeout is not None else 3600,
-        )
+        proc = None
+        for attempt in range(3):
+            proc = _eai(
+                "job", "exec", self.job_id, "--", "bash", "-c", remote,
+                timeout=(timeout + 60) if timeout is not None else 3600,
+            )
+            if proc.returncode == 0:
+                break
+            # EAI control-plane 5xx blips surface as CLI "internal error"
+            # (http: 500) etc. Retrying is safe only when the remote command
+            # never started; exit 7 = transport error before execution.
+            err = proc.stderr or ""
+            transient = any(t in err for t in ("http: 500", "internal error", "502", "503", "504", "no response"))
+            if attempt < 2 and transient and proc.returncode in (1, 7):
+                time.sleep(4 * (attempt + 1))
+                continue
+            break
         if proc.returncode != 0:
             short_tail = 600
             err = proc.stderr or ""
