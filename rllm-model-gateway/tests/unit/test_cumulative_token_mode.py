@@ -159,10 +159,7 @@ class TestCumulativeTokenMode:
         assert prompt[:8] == [1, 2, 3, 4, 5, 10, 11, 12]
 
     def test_duplicate_resend_overwrites_trace_not_appends(self, cumulative_gateway):
-        """A duplicate resend (upstream retry) replays the turn in place and
-        OVERWRITES that turn's trace, instead of leaving a second, superseded
-        trace for one logical turn (which would break the trainer's linear merge).
-        """
+        """A recognized replay replaces one logical turn instead of appending."""
         import httpx as _httpx
 
         server, _mock_vllm = cumulative_gateway
@@ -179,16 +176,17 @@ class TestCumulativeTokenMode:
         oai.chat.completions.create(model="mock-model", messages=turn2)
 
         with _httpx.Client(timeout=10.0) as c:
-            before = len(c.get(f"{gw_url}/sessions/{sid}/traces").json())  # 2 traces: turn1 + turn2
+            before = c.get(f"{gw_url}/sessions/{sid}/traces").json()
 
-        # Resend turn 2 identically -> DUPLICATE -> replay (regenerate in place).
+        # Resend turn 2 identically -> replay and replace that trace.
         oai.chat.completions.create(model="mock-model", messages=turn2)
 
         with _httpx.Client(timeout=10.0) as c:
-            after = len(c.get(f"{gw_url}/sessions/{sid}/traces").json())
+            after = c.get(f"{gw_url}/sessions/{sid}/traces").json()
 
-        assert before == 2
-        assert after == before  # replay overwrote turn 2's trace; store did not grow
+        assert len(before) == 2
+        assert len(after) == 2
+        assert [t["trace_id"] for t in after] == [t["trace_id"] for t in before]
 
     def test_traces_have_correct_token_ids(self, cumulative_gateway):
         """Both turns produce traces with prompt_token_ids and completion_token_ids."""
@@ -611,7 +609,7 @@ class TestPerRequestLineageBinding:
         assert a.message_count == 2
         assert b.turn_count == 0
 
-    def test_next_trace_id_replay_reuses_else_fresh(self):
+    def test_replay_reuses_the_current_trace_id(self):
         from rllm_model_gateway.token_accumulator import TokenAccumulator
 
         acc = TokenAccumulator(_MockRenderer(), session_id="sess")

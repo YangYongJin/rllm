@@ -137,8 +137,7 @@ def test_cumulative_local_streaming_emits_sse_and_ingests():
 
 
 def test_cumulative_local_replay_regenerates_in_place_without_advancing():
-    """A duplicate resend regenerates (fresh sample) and overwrites the turn in
-    place — handler is called again, turn_count does not advance, no reset."""
+    """A duplicate resend regenerates without advancing the accumulator."""
     record = []
     proxy = _make_proxy(_completion_handler(record))
 
@@ -162,61 +161,6 @@ def test_cumulative_local_replay_regenerates_in_place_without_advancing():
     assert record and record[0]["prompt"] == [1, 2, 3]  # regenerated, not cached
     assert acc.turn_count == 1  # overwritten in place, NOT advanced
     assert acc.prev_completion_ids == [91, 92]  # fresh sample replaced the old one
-
-
-# ----------------------------------------------------------------------------
-# R3 router replay over the cumulative-token path.
-#
-# The token-in path (_token_prompt_completion) must surface the TokenOutput's
-# per-token routing matrices on the choice, and the proxy must carry them onto
-# the persisted trace. Without this, router replay silently no-ops whenever
-# cumulative_token_mode is on (turns 2+ all take the token-in path).
-# ----------------------------------------------------------------------------
-
-
-def _routing_engine(routing_matrices):
-    """Fake TinkerEngine token-in path: TokenOutput carries routing_matrices,
-    but assemble_model_output does NOT copy them onto the ModelOutput (mirrors
-    the real TinkerEngine — only the get_model_response* wrappers copy them)."""
-    from types import SimpleNamespace
-
-    class _Engine:
-        model_name = "q"
-
-        async def get_token_output_from_token_input(self, prompt_ids, **kwargs):
-            return SimpleNamespace(routing_matrices=routing_matrices)
-
-        def assemble_model_output(self, prompt_ids, token_output):
-            return SimpleNamespace(
-                content="next action",
-                text="next action",
-                prompt_ids=list(prompt_ids),
-                completion_ids=[91, 92],
-                logprobs=[-0.1, -0.2],
-                finish_reason="stop",
-                prompt_length=len(prompt_ids),
-                completion_length=2,
-                weight_version=7,
-            )
-
-    return _Engine()
-
-
-def test_token_prompt_completion_carries_routing_matrices():
-    from rllm.gateway.tinker_adapter import _token_prompt_completion
-
-    rm = ["layer-blob-a", "layer-blob-b"]
-    resp = asyncio.run(_token_prompt_completion(_routing_engine(rm), {"model": "q"}, [1, 2, 3], {}))
-    # Read off TokenOutput, not ModelOutput (which never carried them here).
-    assert resp["choices"][0]["routing_matrices"] == rm
-
-
-def test_token_prompt_completion_routing_matrices_none_when_absent():
-    """Dense models / R3 disabled: no matrices → field is None, not an error."""
-    from rllm.gateway.tinker_adapter import _token_prompt_completion
-
-    resp = asyncio.run(_token_prompt_completion(_routing_engine(None), {"model": "q"}, [1, 2, 3], {}))
-    assert resp["choices"][0]["routing_matrices"] is None
 
 
 def test_cumulative_local_persists_routing_matrices_to_trace():

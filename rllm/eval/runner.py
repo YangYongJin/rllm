@@ -43,6 +43,7 @@ async def run_dataset(
     sampling_params: dict | None = None,
     attempts: int = 1,
     gateway_port: int | None = None,
+    compact_episodes: bool = False,
 ) -> tuple[EvalResult, list]:
     """Run a list of :class:`rllm.types.Task` objects through :class:`AgentFlowEngine`.
 
@@ -67,6 +68,8 @@ async def run_dataset(
             into ``attempts`` adjacent copies; the engine numbers sibling rollouts
             ``task_id:0..n-1`` (training's GRPO convention) and the EvalResult
             groups them back by task to compute ``pass_at``.
+        compact_episodes: Keep graph-backed trajectories in returned episodes and
+            completion callbacks instead of materializing cumulative steps.
 
     Returns ``(EvalResult, list[Episode])``.
     """
@@ -93,12 +96,8 @@ async def run_dataset(
     # and tear down one ourselves (single-shot).
     owned_gateway = gateway is None
     if owned_gateway:
-        # Auto-tunnel for off-host sandboxes (same predicate AgentTrainer uses).
-        # Resolve like training does: $RLLM_GATEWAY_TUNNEL → a running
-        # `rllm tunnel up` daemon → cloudflared quick-tunnel fallback. Quick
-        # tunnels enforce a 120s origin read timeout, which kills slow
-        # non-streaming LLM calls (CF 524) — a configured ngrok tunnel avoids
-        # that, so eval must honor it, not just training.
+        # Each remote eval owns its tunnel instead of reusing the singleton
+        # `rllm tunnel up` daemon and its fixed origin port.
         gateway_tunnel: str | None = None
         resolved_gateway_port = gateway_port
         if not is_local_sandbox_backend(sandbox_backend):
@@ -148,6 +147,7 @@ async def run_dataset(
         raise_on_error=False,  # capture per-task errors as error Episodes
         hooks=hooks,
         val_sampling_params=sampling_params or None,  # eval is always validation
+        compact_episodes=compact_episodes,
     )
 
     warm_queue = None

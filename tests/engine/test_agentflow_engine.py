@@ -75,6 +75,61 @@ def test_run_single_passes_validation_flag_and_preserves_termination_reason():
     assert episode.termination_reason == TerminationReason.ERROR
 
 
+def test_compact_gateway_validation_graph_is_opt_in():
+    from rllm_model_gateway.models import TraceGraph
+
+    from rllm.types import TrajectoryDelta
+
+    class _CompactGateway(_Gateway):
+        store = "compact"
+
+        def __init__(self):
+            super().__init__()
+            self.fetches = []
+
+        async def aget_traces(self, session_id):
+            self.fetches.append("flat")
+            return [_valid_token_trace(session_id)]
+
+        async def aget_trace_graph(self, session_id):
+            self.fetches.append("graph")
+            graph = TraceGraph(format="compact", version=1, deltas=[])
+            graph.add(_valid_token_trace(session_id))
+            return graph
+
+    gateway = _CompactGateway()
+    engine = AgentFlowEngine(agent_flow=_Agent(), evaluator=_Evaluator(), gateway=gateway, model="test-model", n_parallel_tasks=1)
+    compact_engine = AgentFlowEngine(
+        agent_flow=_Agent(),
+        evaluator=_Evaluator(),
+        gateway=gateway,
+        model="test-model",
+        n_parallel_tasks=1,
+        compact_episodes=True,
+    )
+    task = task_from_row({"question": "q"}, "task")
+    completed = []
+    try:
+        validation_episode = asyncio.run(engine._run_single(task, "task:validation", is_validation=True))
+        compact_validation = asyncio.run(
+            compact_engine.execute_tasks(
+                [task],
+                task_ids=["compact"],
+                is_validation=True,
+                on_episode_complete=lambda _idx, episode: completed.append(episode),
+            )
+        )[0]
+        asyncio.run(engine._run_single(task, "task:training", is_validation=False))
+    finally:
+        engine.shutdown()
+        compact_engine.shutdown()
+
+    assert gateway.fetches == ["flat", "graph", "graph"]
+    assert isinstance(validation_episode.trajectories[0], Trajectory)
+    assert isinstance(compact_validation.trajectories[0], TrajectoryDelta)
+    assert isinstance(completed[0].trajectories[0], TrajectoryDelta)
+
+
 def _empty_token_trace(session_id: str):
     from rllm_model_gateway.models import TraceRecord
 
@@ -267,6 +322,53 @@ def test_no_usable_model_output_detects_dead_upstream():
     assert _no_usable_model_output(NS(trajectories=[NS(steps=[step(""), step("")])])) is True  # dead proxy
     assert _no_usable_model_output(NS(trajectories=[NS(steps=[])])) is True  # no LLM calls (the broken-eval case)
     assert _no_usable_model_output(NS(trajectories=[NS(steps=[step(""), step("echo hi")])])) is False  # partial — real work
+
+
+def test_llm_free_harness_opts_out_of_the_empty_completion_canary():
+    """The oracle has zero completions by construction, so the canary would
+    report its every failure — a task whose reference solution fails its own
+    verifier — as an upstream outage."""
+    from rllm.harnesses.mini_swe_agent import MiniSweAgentHarness
+    from rllm.harnesses.oracle import OracleHarness
+
+    assert OracleHarness.makes_llm_calls is False
+    # True default: model-driven harnesses keep the canary without declaring it.
+    assert getattr(MiniSweAgentHarness, "makes_llm_calls", True) is True
+
+
+@pytest.mark.parametrize(("makes_llm_calls", "warns"), [(None, True), (False, False), (True, True)])
+def test_empty_completion_progress_canary_respects_llm_free_flows(monkeypatch, makes_llm_calls, warns):
+    from rllm.types import Step
+
+    agent = _Agent()
+    if makes_llm_calls is not None:
+        agent.makes_llm_calls = makes_llm_calls
+    gateway = _Gateway()
+    engine = AgentFlowEngine(
+        agent_flow=agent,
+        evaluator=_Evaluator(),
+        gateway=gateway,
+        model="test-model",
+        n_parallel_tasks=1,
+    )
+    episode = Episode(
+        id="task:0",
+        trajectories=[Trajectory(name="solver", steps=[Step(output="[model-free diagnostic]")])],
+    )
+
+    async def process_task_with_retry(task, task_id, rollout_idx, result_idx, is_validation=False):
+        return task_id, rollout_idx, result_idx, episode
+
+    engine.process_task_with_retry = process_task_with_retry
+    warnings = []
+    monkeypatch.setattr("rllm.engine.agentflow_engine.colorful_print", lambda message, **kwargs: warnings.append(message))
+
+    try:
+        asyncio.run(engine.execute_tasks([task_from_row({"question": "q"}, "task")], task_ids=["task"]))
+    finally:
+        engine.shutdown()
+
+    assert bool(warnings) is warns
 
 
 def test_infra_taxonomy_membership_and_mapping():

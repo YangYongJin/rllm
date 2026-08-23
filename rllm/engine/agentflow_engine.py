@@ -30,13 +30,29 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from rllm_model_gateway.models import TraceGraph
 from tqdm import tqdm
 
 from rllm.data.utils import task_from_row
-from rllm.engine.trace_converter import compute_step_metrics, filter_empty_response_traces, trace_record_to_step
+from rllm.engine.trace_converter import _prepare_trace_items, compute_step_metrics, trace_delta_to_step_delta, trace_record_to_step
 from rllm.eval.types import EvalOutput
 from rllm.gateway.manager import container_reachable_url
-from rllm.types import INFRA_ERROR_REASONS, AgentConfig, Episode, Step, Task, TerminationReason, Trajectory, flow_accepts_env, run_agent_flow, termination_reason_from_error
+from rllm.types import (
+    INFRA_ERROR_REASONS,
+    AgentConfig,
+    Episode,
+    Step,
+    StepDelta,
+    Task,
+    TerminationReason,
+    Trajectory,
+    TrajectoryDelta,
+    _index_step_deltas,
+    _materialize_trajectory_deltas,
+    flow_accepts_env,
+    run_agent_flow,
+    termination_reason_from_error,
+)
 from rllm.utils import colorful_print
 from rllm.utils.group_summary import format_group_finished
 from rllm.utils.priority_semaphore import EVAL_PRIORITY, TRAIN_PRIORITY, PrioritySemaphore
@@ -88,7 +104,7 @@ def _step_returned_nothing(step) -> bool:
         return False
     if getattr(model_output, "tool_calls", None) or getattr(model_output, "completion_ids", None):
         return False
-    msgs = getattr(step, "chat_completions", None)
+    msgs = getattr(step, "chat_completions", None) or getattr(step, "chat_completions_suffix", None)
     last = msgs[-1] if msgs else None
     if isinstance(last, dict):
         message_fields = (last.get("content"), last.get("reasoning"), last.get("reasoning_content"))
@@ -163,7 +179,7 @@ class TaskHooks(Protocol):
 
 def enrich_episode_with_traces(
     episode: Episode,
-    traces: list[TraceRecord],
+    traces: list[TraceRecord] | TraceGraph,
     uid: str,
     task: dict,
     *,
@@ -189,9 +205,7 @@ def enrich_episode_with_traces(
     the evaluator reads ``model_response`` / ``chat_completions``, which are
     populated regardless of token-ID availability.
     """
-    trace_attempt_count = len(traces)
-    traces = filter_empty_response_traces(traces)
-    empty_response_traces_dropped = trace_attempt_count - len(traces)
+    graph, trace_items, empty_response_traces_dropped = _prepare_trace_items(traces)
     if empty_response_traces_dropped:
         logger.warning(
             "[%s] dropping %d empty-response trace(s) before episode enrichment",
@@ -199,7 +213,7 @@ def enrich_episode_with_traces(
             empty_response_traces_dropped,
         )
 
-    if not traces:
+    if not trace_items:
         logger.warning("[%s] No traces found — returning episode without token data", uid)
         # Coerce to the canonical Trajectory/Episode shape so downstream
         # pydantic validators (e.g. TrajectoryGroup.trajectories) accept
@@ -221,7 +235,7 @@ def enrich_episode_with_traces(
         )
 
     termination_reason = episode.termination_reason
-    final_trace = traces[-1]
+    final_trace = trace_items[-1]
     if (
         termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED
         and final_trace.finish_reason == "length"
@@ -230,7 +244,8 @@ def enrich_episode_with_traces(
         termination_reason = TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED
 
     # Convert all traces to training steps
-    training_steps = [trace_record_to_step(t) for t in traces]
+    training_steps: list[Step | StepDelta] = [trace_delta_to_step_delta(t) for t in trace_items] if graph is not None else [trace_record_to_step(t) for t in trace_items]
+    prompt_lengths = _index_step_deltas(training_steps)[1] if graph is not None else {step.id: len(step.prompt_ids) for step in training_steps}
 
     # Bad traces (missing or empty token_ids) silently corrupt loss math and
     # shrink GRPO groups; raise on real mismatches so retries can reissue.
@@ -244,7 +259,7 @@ def enrich_episode_with_traces(
     # rollout — at high MAX_TURNS the failure rate would exhaust retries.
     if agent_populates_steps and len(training_steps) > n_agent_steps:
         extra = training_steps[n_agent_steps:]
-        extras_all_malformed = all(not s.model_output.prompt_ids or not s.model_output.completion_ids for s in extra)
+        extras_all_malformed = all(not prompt_lengths[s.id] or not s.response_ids for s in extra)
         if extras_all_malformed:
             logger.warning(
                 "[%s] dropping %d trailing malformed trace(s); keeping %d aligned with agent_steps",
@@ -254,8 +269,8 @@ def enrich_episode_with_traces(
             )
             training_steps = training_steps[:n_agent_steps]
 
-    empty_prompt = sum(1 for s in training_steps if not s.model_output.prompt_ids)
-    empty_compl = sum(1 for s in training_steps if not s.model_output.completion_ids)
+    empty_prompt = sum(1 for s in training_steps if not prompt_lengths[s.id])
+    empty_compl = sum(1 for s in training_steps if not s.response_ids)
     # Only enforce step-count parity when the agent actually populates steps.
     # Trajectories with no agent steps absorb remaining traces wholesale
     # (see branch below), and trajectories with steps consume traces 1:1.
@@ -269,34 +284,37 @@ def enrich_episode_with_traces(
         raise EnrichMismatchError(f"[{uid}] enrich mismatch: traces={len(training_steps)} agent_steps={n_agent_steps} empty_prompt_ids={empty_prompt} empty_completion_ids={empty_compl}")
 
     # Build enriched trajectories
-    enriched_trajectories: list[Trajectory] = []
+    enriched_trajectories: list[Trajectory | TrajectoryDelta] = []
     trace_idx = 0
 
+    def select_steps(start: int, stop: int) -> list[Step] | list[StepDelta]:
+        if graph is None or (start == 0 and stop == len(training_steps)):
+            return training_steps[start:stop]
+        ids = [step.id for step in training_steps[start:stop]]
+        return [trace_delta_to_step_delta(delta) for delta in graph.slice(ids).deltas]
+
     for traj in episode.trajectories:
-        traj_steps: list[Step] = []
+        start = trace_idx
 
         if traj.steps:
             # Match agent steps to traces positionally. The validation above
             # guarantees trace_idx < len(training_steps) for every agent_step
             # when agent_populates_steps is True.
-            for agent_step in traj.steps:
-                step = training_steps[trace_idx]
-                # Preserve agent-side fields (the trace doesn't carry these — it
-                # only holds the raw LLM call) -- action, reward, done
+            trace_idx += len(traj.steps)
+            traj_steps = select_steps(start, trace_idx)
+            # Preserve agent-side fields (the trace only holds the raw LLM call).
+            for step, agent_step in zip(traj_steps, traj.steps, strict=True):
                 step.action = agent_step.action
                 step.reward = agent_step.reward
                 step.done = agent_step.done
-                trace_idx += 1
-                traj_steps.append(step)
         else:
             # No agent steps — assign all remaining traces to this trajectory
             # (common for single-trajectory agents that don't populate steps)
-            remaining = training_steps[trace_idx:]
-            trace_idx += len(remaining)
-            traj_steps = remaining
+            trace_idx = len(training_steps)
+            traj_steps = select_steps(start, trace_idx)
 
         enriched_trajectories.append(
-            Trajectory(
+            (TrajectoryDelta if graph is not None else Trajectory)(
                 uid=traj.uid,
                 name=traj.name,
                 task=traj.task or task,
@@ -307,12 +325,12 @@ def enrich_episode_with_traces(
         )
 
     # If there are unmatched traces and no trajectories existed, create one
-    if not episode.trajectories and traces:
+    if not episode.trajectories and trace_items:
         enriched_trajectories = [
-            Trajectory(
+            (TrajectoryDelta if graph is not None else Trajectory)(
                 name="default",
                 task=task,
-                steps=training_steps,
+                steps=select_steps(0, len(training_steps)),
             )
         ]
 
@@ -336,8 +354,9 @@ def enrich_episode_with_traces(
     )
 
 
-def _summarize_llm_latencies(traces: list[Any], agentflow_s: float) -> tuple[float, float]:
+def _summarize_llm_latencies(traces: list[Any] | TraceGraph, agentflow_s: float) -> tuple[float, float]:
     """Return ``(llm_sum_s, llm_wall_s)`` from trace latencies (sum and interval-union)."""
+    traces = traces.deltas if isinstance(traces, TraceGraph) else traces
     if not traces:
         return 0.0, 0.0
 
@@ -439,6 +458,7 @@ class AgentFlowEngine:
         hooks: TaskHooks | None = None,
         train_sampling_params: dict | None = None,
         val_sampling_params: dict | None = None,
+        compact_episodes: bool = False,
     ) -> None:
         if evaluator is None and hooks is None:
             raise ValueError("AgentFlowEngine requires either an `evaluator` (single evaluator for every task) or `hooks` (per-task evaluator + setup/teardown). Both cannot be None.")
@@ -462,6 +482,7 @@ class AgentFlowEngine:
         self.hooks = hooks
         self.train_sampling_params = train_sampling_params
         self.val_sampling_params = val_sampling_params
+        self.compact_episodes = compact_episodes
 
         self.n_parallel_tasks = n_parallel_tasks
         self.executor = ThreadPoolExecutor(max_workers=n_parallel_tasks)
@@ -560,14 +581,15 @@ class AgentFlowEngine:
                 # end — keeps the UI live and avoids a giant end-of-run flush.
                 if on_episode_complete is not None and episode is not None:
                     try:
-                        on_episode_complete(result_idx, episode)
+                        callback_episode = episode if self.compact_episodes else _materialize_trajectory_deltas(episode)
+                        on_episode_complete(result_idx, callback_episode)
                     except Exception:
                         logger.debug("on_episode_complete callback error", exc_info=True)
                 # Canary: a rollout whose LLM completions are ALL empty means the
                 # upstream returned nothing (dead litellm proxy, gateway "no healthy
                 # workers", or the model itself). Surface it loudly — otherwise the
                 # run silently produces garbage (every rollout scores 0).
-                if episode is not None:
+                if episode is not None and getattr(self.agent_flow, "makes_llm_calls", True):
                     _steps = [s for t in (episode.trajectories or []) for s in (t.steps or [])]
                     if _all_steps_returned_nothing(_steps):
                         n_empty_rollouts += 1
@@ -732,7 +754,8 @@ class AgentFlowEngine:
         )
         try:
             t = time.perf_counter()
-            traces = await self.gateway.aget_traces(uid)
+            compact_fetch = (self.compact_episodes or not is_validation) and getattr(self.gateway, "store", None) == "compact" and hasattr(self.gateway, "aget_trace_graph")
+            traces = await (self.gateway.aget_trace_graph(uid) if compact_fetch else self.gateway.aget_traces(uid))
             timings["time/traces_s"] = time.perf_counter() - t
 
             enriched = await self._finish_episode(
@@ -872,7 +895,7 @@ class AgentFlowEngine:
     async def _finish_episode(
         self,
         raw_episode: Episode,
-        traces: list[TraceRecord],
+        traces: list[TraceRecord] | TraceGraph,
         uid: str,
         task_obj: Task,
         ctx: TaskContext,
@@ -886,7 +909,8 @@ class AgentFlowEngine:
         (non-vLLM upstreams legitimately return no token IDs and evaluators
         read message text). Records ``time/evaluator_s``,
         ``time/agentflow_llm_{sum,wall}_s``, and ``n_turns`` when ``_timings``
-        is provided.
+        is provided. Evaluators retain the legacy flat Episode contract;
+        compact training materializes that view transiently at this boundary.
         """
         loop = asyncio.get_event_loop()
 
@@ -899,7 +923,8 @@ class AgentFlowEngine:
         )
 
         t = time.perf_counter()
-        if self.verify_only_on_env_done and enriched.termination_reason != TerminationReason.ENV_DONE:
+        evaluation_episode = _materialize_trajectory_deltas(enriched)
+        if getattr(self, "verify_only_on_env_done", False) and enriched.termination_reason != TerminationReason.ENV_DONE:
             eval_output = EvalOutput(
                 reward=0.0,
                 is_correct=False,
@@ -912,7 +937,7 @@ class AgentFlowEngine:
                 self.executor,
                 ctx.evaluator.evaluate,
                 task_obj,
-                enriched,
+                evaluation_episode,
             )
             eval_output.metadata.setdefault("verifier_skipped", 0.0)
         if _timings is not None:
@@ -924,7 +949,9 @@ class AgentFlowEngine:
             _timings["n_turns"] = float(enriched.metrics.get("steps_collected", 0))
 
         # Preserve per-trajectory rewards set by multi-trajectory evaluators.
-        for traj in enriched.trajectories:
+        for traj, evaluated_traj in zip(enriched.trajectories, evaluation_episode.trajectories, strict=True):
+            traj.reward = evaluated_traj.reward
+            traj.signals = evaluated_traj.signals
             if traj.reward is None:
                 traj.reward = eval_output.reward
             if not traj.signals:
@@ -935,7 +962,11 @@ class AgentFlowEngine:
         for signal in eval_output.signals:
             enriched.metrics[signal.name] = signal.value
 
-        if _no_usable_model_output(enriched) and not enriched.is_correct and enriched.termination_reason not in INFRA_ERROR_REASONS:
+        # A harness that drives no model (oracle) has zero completions by
+        # construction, so the canary below would report its every failure — i.e.
+        # a task whose reference solution fails its own verifier — as an outage.
+        _llm_driven = getattr(self.agent_flow, "makes_llm_calls", True)
+        if _llm_driven and _no_usable_model_output(enriched) and not enriched.is_correct and enriched.termination_reason not in INFRA_ERROR_REASONS:
             # The agent produced nothing usable — no LLM calls at all, or every
             # call came back empty: a downed/erroring upstream (proxy died, auth or
             # tunnel failure), NOT a clean rollout. The reward (0) is meaningless;

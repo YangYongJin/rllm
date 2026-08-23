@@ -1,6 +1,6 @@
 """Eval CLI command.
 
-``rllm eval <benchmark> --agent <name> [--evaluator <name>] [--base-url <url>] [--model <name>]``
+``rllm eval <benchmark> --agent <name> [--evaluator <name>] [--provider <name>] [--base-url <url>] [--model <name>]``
 
 When ``--base-url`` is omitted, a LiteLLM proxy is auto-started using the
 configuration from ``rllm setup`` (stored in ``~/.rllm/config.json``).
@@ -19,9 +19,12 @@ from rllm import paths
 from rllm.cli._pull import load_dataset_catalog, pull_dataset
 from rllm.cli._sampling import SAMPLING_PARAMS_HELP as _SAMPLING_PARAMS_HELP
 from rllm.cli._ui import console, fail, info_panel, not_found, parse_index_spec
-from rllm.types import Task
+from rllm.eval.config import SUPPORTED_PROVIDERS
+from rllm.types import Task, _materialize_trajectory_deltas
 
 logger = logging.getLogger(__name__)
+
+_EVAL_PROVIDERS = [provider for provider in SUPPORTED_PROVIDERS if provider != "custom"]
 
 
 def _suggest_benchmarks(name: str, catalog_names: list[str], max_suggestions: int = 3) -> list[str]:
@@ -128,6 +131,7 @@ def _run_eval(
     agent_metadata: dict | None = None,
     enable_ui: bool = False,
     save_episodes: bool = True,
+    compact_episodes: bool = True,
     episodes_dir: str | None = None,
     use_snapshot: bool = True,
     warm_queue_size: int = 0,
@@ -439,6 +443,7 @@ def _run_eval(
             "split": split,
             "timestamp": timestamp,
             "attempts": attempts,
+            "episode_format": "compact" if compact_episodes else "full",
         }
     )
     episode_store = run_store if save_episodes else None
@@ -491,7 +496,7 @@ def _run_eval(
                 except Exception:
                     logger.debug("episode_store.write failed", exc_info=True)
             if _ui_callback is not None:
-                _ui_callback(episode)
+                _ui_callback(_materialize_trajectory_deltas(episode))
 
     # Single execution path: every Task goes through ``AgentFlowEngine``
     # via ``SandboxTaskHooks``. The engine fronts every LLM call with the rLLM
@@ -518,6 +523,7 @@ def _run_eval(
             sampling_params=(sampling_config.as_dict() if sampling_config is not None else None),
             attempts=attempts,
             gateway_port=gateway_port,
+            compact_episodes=save_episodes and compact_episodes,
         )
     )
 
@@ -594,7 +600,14 @@ def _run_eval(
     "--proxy-port", "proxy_port", default=None, type=int, help="Pin the auto-started LiteLLM proxy to this port. Default: a free port is picked automatically (so concurrent eval jobs don't collide)."
 )
 @click.option("--gateway-port", default=None, type=int, help="Local model-gateway port. Set this when an existing tunnel forwards to a fixed local port.")
-@click.option("--model", default=None, help="Model name to evaluate. Defaults to configured model from 'rllm setup'.")
+@click.option(
+    "--provider",
+    "provider_override",
+    default=None,
+    type=click.Choice(_EVAL_PROVIDERS, case_sensitive=False),
+    help="Provider to use for this run, overriding 'rllm setup' without changing it. Requires --model and uses the provider's stored API key.",
+)
+@click.option("--model", default=None, help="Model name to evaluate. Defaults to the configured model unless --provider or --base-url is used.")
 @click.option("--split", default=None, help="Dataset split (default: from catalog eval_split).")
 @click.option("--concurrency", default=64, type=int, help="Number of parallel requests.")
 @click.option("--attempts", default=1, type=int, help="Independent rollouts per task; reports pass@k for k=1..N (default: 1).")
@@ -624,6 +637,11 @@ def _run_eval(
 )
 @click.option("--ui/--no-ui", "enable_ui", default=None, help="Enable/disable live UI logging. Default: auto-enabled when logged in (see 'rllm login').")
 @click.option("--save-episodes/--no-save-episodes", "save_episodes", default=True, help="Save each Episode as its own JSON file for later visualization (default: enabled).")
+@click.option(
+    "--compact-episodes/--full-episodes",
+    default=True,
+    help="Save graph-backed Episode JSONs without repeated cumulative messages and token IDs (default: compact).",
+)
 @click.option("--episodes-dir", "episodes_dir", default=None, help="Directory to write the episode JSONs into. Default: ~/.rllm/eval_results/<bench>_<model>_<timestamp>/.")
 @click.option("--sampling-params", "sampling_params", default=None, help=_SAMPLING_PARAMS_HELP)
 @click.option("--temperature", default=None, type=float, help="Sampling temperature (shortcut for --sampling-params temperature=...).")
@@ -661,6 +679,7 @@ def eval_cmd(
     base_url: str | None,
     proxy_port: int | None,
     gateway_port: int | None,
+    provider_override: str | None,
     model: str | None,
     split: str | None,
     concurrency: int,
@@ -674,6 +693,7 @@ def eval_cmd(
     warm_queue_size: int,
     enable_ui: bool | None,
     save_episodes: bool,
+    compact_episodes: bool,
     episodes_dir: str | None,
     sampling_params: str | None,
     temperature: float | None,
@@ -709,6 +729,8 @@ def eval_cmd(
     proxy_manager = None
 
     if base_url is not None:
+        if provider_override is not None:
+            fail("--provider cannot be used with --base-url; the direct endpoint already defines routing.")
         # Direct mode: user provided --base-url, require --model too
         if model is None:
             fail("--model is required when --base-url is provided.")
@@ -719,6 +741,10 @@ def eval_cmd(
         from rllm.eval.config import load_config
 
         config = load_config()
+        if provider_override is not None and model is None:
+            fail("--model is required when --provider is provided.")
+        if provider_override is not None:
+            config.provider = provider_override
 
         # A ``tinker://`` sampler-checkpoint path (produced by ``rllm sft`` on the
         # tinker backend) is served by the Tinker OAI endpoint, which the built-in
@@ -758,6 +784,10 @@ def eval_cmd(
                 model_name=model,
                 api_key=api_key,
                 proxy_port=proxy_port,
+                # Non-core sampling params (reasoning_effort, …) the proxy must
+                # forward instead of dropping. The gateway enforces them per
+                # call; this keeps litellm from deleting them en route.
+                sampling_extra=sampling_config.extra if sampling_config else None,
             )
             with Status(f"[dim]Starting LiteLLM proxy for [bold]{provider}/{model}[/bold]...[/]", console=console):
                 try:
@@ -816,6 +846,7 @@ def eval_cmd(
             agent_metadata=agent_metadata,
             enable_ui=enable_ui,
             save_episodes=save_episodes,
+            compact_episodes=compact_episodes,
             episodes_dir=episodes_dir,
             use_snapshot=use_snapshot,
             warm_queue_size=warm_queue_size,

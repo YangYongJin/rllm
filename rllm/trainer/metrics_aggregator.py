@@ -36,7 +36,8 @@ def _infer_rule(key: str) -> str:
     Resolution order:
     1. Explicit sum keys
     2. Prefix-based rules (last or mean)
-    3. Keyword-based rules (/max, /min, /mean, /avg, /std, /fraction)
+    3. Keyword-based rules in the final metric component
+       (max, min, mean, avg, std, fraction)
     4. Default: mean
     """
     if key in _SUM_KEYS:
@@ -58,22 +59,20 @@ def _infer_rule(key: str) -> str:
         if key.startswith(prefix):
             return "mean"
 
-    # Infer extrema from the final path component only. Metric namespaces may
-    # contain these strings (for example, ``mini-swe-agent``).
-    suffix = key.rsplit("/", 1)[-1]
-    if ":" in suffix:
-        suffix = suffix.rsplit(":", 1)[-1]
-    if suffix == "sum":
+    # Infer from tokens in the final metric component only. A namespace such as
+    # ``mini-swe-agent`` must not make every reward metric use the min reducer.
+    metric_tokens = set(key.rsplit("/", 1)[-1].replace(":", "_").split("_"))
+    if "sum" in metric_tokens:
         return "sum"
-    if suffix == "last":
+    if "last" in metric_tokens:
         return "last"
-    if suffix == "max":
+    if "max" in metric_tokens:
         return "max"
-    if suffix == "min":
+    if "min" in metric_tokens:
         return "min"
-    if suffix in ("mean", "avg"):
+    if "mean" in metric_tokens or "avg" in metric_tokens:
         return "mean"
-    if suffix == "std" or suffix.startswith("fraction"):
+    if "std" in metric_tokens or "fraction" in metric_tokens:
         return "mean"
 
     return "mean"

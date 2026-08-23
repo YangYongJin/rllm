@@ -22,6 +22,7 @@ import inspect
 import logging
 import os
 import re
+import shlex
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -103,6 +104,60 @@ def _effective_verifier_timeout(task: Task) -> float | None:
     return float(declared) if declared is not None else None
 
 
+def _capture_git_heads(task: Task, sandbox: Sandbox) -> dict[str, str]:
+    """Map ``repo root -> HEAD sha`` for the sandbox's git repos, before the agent runs.
+
+    Handed to :class:`ShellScriptEvaluator`, which puts HEAD back (soft) right
+    before grading — see :meth:`ShellScriptEvaluator._restore_git_heads` for why
+    an agent's commits break in-sandbox verifiers. Called at evaluator-resolution
+    time, which the hook does after environment setup and before the agent, so
+    what's recorded is the image's own commit.
+
+    Scans the declared ``workdir`` plus the top-level directories, so it covers
+    ``/app``, ``/testbed``, ``/workspace`` and friends without knowing which task
+    family it's looking at. Best-effort: a git-less environment yields an empty
+    map and the restore is a no-op.
+
+    Only for tasks that declared ``[verifier].environment_mode = "separate"``
+    and are being graded in the agent's container anyway — i.e. exactly where
+    rLLM knowingly deviates from the contract, which is what makes the verifier's
+    pristine-HEAD assumption false. Moving HEAD is wrong for a task whose agent is
+    *supposed* to move it (a shared-mode task that builds commits: terminal-bench's
+    git-object-builder asserts on ``refs/heads/main`` and ``git ls-tree HEAD``), so
+    shared-mode tasks are left alone. ``RLLM_VERIFIER_RESTORE_GIT_HEAD`` forces it
+    on (``1``) for a shared task whose verifier does assume a pristine HEAD, or off
+    (``0``) entirely.
+    """
+    from rllm.env import env_int
+    from rllm.eval.script_evaluator import _GIT
+    from rllm.tasks.loader import VERIFIER_MODE_SEPARATE
+
+    override = os.environ.get("RLLM_VERIFIER_RESTORE_GIT_HEAD")
+    if override is not None:
+        if not env_int("RLLM_VERIFIER_RESTORE_GIT_HEAD", 1):
+            return {}
+    elif task.metadata.get("verifier_mode") != VERIFIER_MODE_SEPARATE:
+        return {}
+    roots = "/*"
+    workdir = task.metadata.get("workdir")
+    if workdir:
+        roots = f"{shlex.quote(str(workdir))} /*"
+    script = (
+        f'for d in {roots}; do [ -d "$d" ] || continue; '
+        f't=$({_GIT} -C "$d" rev-parse --show-toplevel 2>/dev/null) || continue; '
+        f'h=$({_GIT} -C "$t" rev-parse HEAD 2>/dev/null) || continue; '
+        f'printf "%s %s\\n" "$t" "$h"; done | sort -u'
+    )
+    heads: dict[str, str] = {}
+    for line in _safe_exec(sandbox, script, timeout=60).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and len(parts[1]) == 40:
+            heads.setdefault(parts[0], parts[1])
+    if heads:
+        logger.debug("Captured pre-agent git HEADs for %s: %s", task.id, heads)
+    return heads
+
+
 def _resolve_evaluator(
     task: Task,
     sandbox: Sandbox | None,
@@ -113,12 +168,19 @@ def _resolve_evaluator(
     if kind == "sandbox-shell":
         if sandbox is None:
             raise RuntimeError("sandbox-shell verifier requires an active sandbox")
+        from rllm.tasks.loader import VERIFIER_MODE_SEPARATE
+
+        separate = task.metadata.get("verifier_mode") == VERIFIER_MODE_SEPARATE and _separate_verifier_enabled()
         return ShellScriptEvaluator(
             sandbox=sandbox,
             script_path=verifier_config.get("script", "tests/test.sh"),
             verifier_user=task.metadata.get("verifier_user"),
             verifier_timeout=(_effective_verifier_timeout(task) or 600.0),
             reward_file_override=verifier_config.get("reward_file"),
+            git_heads=_capture_git_heads(task, sandbox),
+            verifier_sandbox_factory=(lambda: _create_verifier_sandbox(task, task.metadata.get("sandbox_backend"))) if separate else None,
+            collect_commands=task.metadata.get("verifier_collect") if separate else None,
+            artifacts=task.metadata.get("artifacts") if separate else None,
         )
 
     if kind in ("python-host", "python-hybrid"):
@@ -190,12 +252,22 @@ def _resolve_backend(task: Task, sandbox_backend: str | None) -> str:
     return sandbox_backend or task.metadata.get("sandbox_backend") or "docker"
 
 
-def _create_base_sandbox(task: Task, backend: str, *, image: str | None = None, name: str | None = None, **backend_kwargs) -> Sandbox:
+def _create_base_sandbox(
+    task: Task,
+    backend: str,
+    *,
+    image: str | None = None,
+    name: str | None = None,
+    env_override: dict | None = None,
+    **backend_kwargs,
+) -> Sandbox:
     """Create a sandbox from a base ``image`` — no Dockerfile RUN replay.
 
     ``image`` defaults to the task's resolved base image; pass a snapshot
-    ref to boot from a pre-warmed environment instead. ``backend_kwargs``
-    pass through to the backend constructor (e.g. Modal's ``timeout``).
+    ref to boot from a pre-warmed environment instead. ``env_override``
+    replaces the ``[environment]`` section resources are read from (used for a
+    separate verifier container). ``backend_kwargs`` pass through to the backend
+    constructor (e.g. Modal's ``timeout``).
     """
     from rllm.sandbox.sandboxed_flow import create_sandbox
 
@@ -205,7 +277,7 @@ def _create_base_sandbox(task: Task, backend: str, *, image: str | None = None, 
         name = f"rllm-{safe_id}-{uuid.uuid4().hex[:6]}"
     # Explicit caller kwargs override the per-task resource defaults — both may
     # carry Modal's ``timeout`` (e.g. the snapshot builder's build_timeout).
-    kwargs = {**_sandbox_resource_kwargs(task, backend), **backend_kwargs}
+    kwargs = {**_sandbox_resource_kwargs(task, backend, env_override), **backend_kwargs}
     return create_sandbox(backend, name=name, image=image, **kwargs)
 
 
@@ -256,10 +328,8 @@ def _task_dockerfile(task: Task) -> Path | None:
 
 # Remote backends that build images themselves and so can build the *real* Dockerfile
 # (COPY/ENV/WORKDIR/RUN) instead of pulling FROM + replaying RUN. ``docker`` is excluded
-# because it already builds via ``docker build``; ``local`` cannot build. ``modal`` is a
-# tracked follow-up (it accepts a ``modal.Image`` and already keepalive-overrides the
-# entrypoint, but the from_dockerfile path there is untested — see _dockerfile_image).
-_FROM_DOCKERFILE_BACKENDS = ("daytona",)
+# because it already builds via ``docker build``; ``local`` cannot build.
+_FROM_DOCKERFILE_BACKENDS = ("daytona", "modal")
 
 
 def _builds_from_dockerfile(task: Task, backend: str) -> Path | None:
@@ -282,6 +352,18 @@ def _dockerfile_image(backend: str, dockerfile: Path):
         from daytona import Image  # daytona.Image.from_dockerfile bundles the Dockerfile dir as context
 
         return Image.from_dockerfile(str(dockerfile))
+    if backend == "modal":
+        import modal
+
+        # Modal takes the Dockerfile path and its build context separately; daytona
+        # infers the context from the file's directory, so pass the parent explicitly
+        # to keep COPY resolution identical across the two backends.
+        #
+        # WORKDIR is the directive that makes this matter beyond COPY: harbor SWE tasks
+        # (deepswe/uniswe) do `WORKDIR /app` then `git clone <url> .`, so under the
+        # replay path — which drops WORKDIR — the clone lands in the base image's root,
+        # /app never exists, and every `cd /app` in solve.sh and tests/test.sh fails.
+        return modal.Image.from_dockerfile(dockerfile, context_dir=dockerfile.parent)
     raise ValueError(f"from_dockerfile build unsupported for backend {backend!r}")
 
 
@@ -308,7 +390,13 @@ def _dockerfile_context_fingerprint(dockerfile: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def _create_sandbox_for_task(task: Task, sandbox_backend: str | None) -> Sandbox:
+def _create_sandbox_for_task(
+    task: Task,
+    sandbox_backend: str | None,
+    *,
+    name: str | None = None,
+    env_override: dict | None = None,
+) -> Sandbox:
     """Cold-path sandbox creation.
 
     When a Dockerfile-based task runs on a remote backend that builds images itself
@@ -321,13 +409,61 @@ def _create_sandbox_for_task(task: Task, sandbox_backend: str | None) -> Sandbox
     backend = _resolve_backend(task, sandbox_backend)
     dockerfile = _builds_from_dockerfile(task, backend)
     if dockerfile is not None:
-        return _create_base_sandbox(task, backend, image=_dockerfile_image(backend, dockerfile))
-    sandbox = _create_base_sandbox(task, backend)
+        return _create_base_sandbox(task, backend, image=_dockerfile_image(backend, dockerfile), name=name, env_override=env_override)
+    sandbox = _create_base_sandbox(task, backend, name=name, env_override=env_override)
     _replay_dockerfile(task, sandbox, backend)
     return sandbox
 
 
-def _sandbox_resource_kwargs(task: Task, backend: str) -> dict:
+def _separate_verifier_enabled() -> bool:
+    """Whether to honour ``environment_mode = "separate"`` by grading in a fresh box.
+
+    The task's own declaration is the gate: only ``environment_mode = "separate"``
+    tasks grade in a fresh box, which today means harbor SWE benchmarks like
+    deepswe. Every other benchmark resolves to shared and never reaches this.
+
+    ``RLLM_SEPARATE_VERIFIER_ENV=0`` is an escape hatch back to in-place grading
+    for a task that declares separate — worth knowing about because the contract
+    is *stricter*: it carries the agent's work as ``git diff <base_commit> HEAD``,
+    so uncommitted edits don't count and a harness whose agent never commits
+    scores 0. Harbor tasks instruct the agent to commit for exactly this reason.
+    """
+    from rllm.env import env_int
+
+    return bool(env_int("RLLM_SEPARATE_VERIFIER_ENV", 1))
+
+
+def _verifier_env_section(task: Task) -> dict:
+    """The ``[environment]`` a separate-mode verifier container runs under.
+
+    Harbor's ``resolve_effective_verifier_env_config`` prefers the task's
+    ``[verifier.environment]`` and otherwise copies ``[environment]``. Tasks
+    routinely declare only resources there (deepswe sets cpus/memory/storage and
+    no image), so layer it *over* the task's section rather than replacing it —
+    replacing would drop the image and leave nothing to boot.
+    """
+    return {**(task.metadata.get("environment") or {}), **(task.metadata.get("verifier_environment") or {})}
+
+
+def _create_verifier_sandbox(task: Task, sandbox_backend: str | None) -> Sandbox:
+    """A fresh container to grade a separate-mode task in.
+
+    Harbor builds this image from ``tests/`` as the build context — deepswe's
+    ``tests/Dockerfile`` is "the pinned task image with the hidden tests baked
+    in". Creating from the task's own image reproduces it, because
+    :class:`~rllm.eval.script_evaluator.ShellScriptEvaluator` uploads ``tests/``
+    to ``/tests`` regardless. Resources come from the verifier's own section.
+    """
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]", "-", task.id)
+    return _create_sandbox_for_task(
+        task,
+        sandbox_backend,
+        name=f"rllm-verify-{safe_id}-{uuid.uuid4().hex[:6]}",
+        env_override=_verifier_env_section(task),
+    )
+
+
+def _sandbox_resource_kwargs(task: Task, backend: str, env_override: dict | None = None) -> dict:
     """Map a harbor task's declared ``[environment]`` resources to backend kwargs.
 
     Harbor task.toml declares ``cpus`` / ``memory_mb`` / ``storage_mb``; without
@@ -364,7 +500,7 @@ def _sandbox_resource_kwargs(task: Task, backend: str) -> dict:
     """
     from rllm.env import env_float, env_int, sandbox_timeout_override_s
 
-    env = task.metadata.get("environment", {}) or {}
+    env = env_override if env_override is not None else (task.metadata.get("environment", {}) or {})
     cpus, mem_mb, disk_mb = env.get("cpus"), env.get("memory_mb"), env.get("storage_mb")
 
     # Operator caps clamp the baked-in task.toml values down (see docstring):

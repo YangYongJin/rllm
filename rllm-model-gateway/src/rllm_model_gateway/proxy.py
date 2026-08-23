@@ -58,6 +58,24 @@ _RETRYABLE_HTTP_ERRORS = (
     httpx.RemoteProtocolError,
     httpx.TimeoutException,
 )
+# Upstream statuses the proxy retries itself: provider throttling (429) and
+# transient faults (timeout / gateway / unavailable). See _send_with_retry.
+_RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """The response's ``Retry-After`` delay in seconds, when it sends a usable one.
+
+    Only the delta-seconds form is honored (what LLM providers send); an HTTP-date
+    or a garbage value returns ``None`` so the caller falls back to its own backoff.
+    """
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(float(raw.strip()), 60.0))
+    except ValueError:
+        return None
 
 
 def _strip_logprobs(response: dict[str, Any]) -> dict[str, Any]:
@@ -305,6 +323,8 @@ class ReverseProxy:
         # reads only token-id/logprob/message fields, and serializing the raw
         # dicts (≤120K-token prompt + full response) is the dominant per-request
         # CPU cost on the event loop at high concurrency. Enable for debugging.
+        if capture_raw_payloads and getattr(store, "_compact", False):
+            raise ValueError("capture_raw_payloads is incompatible with compact traces")
         self.capture_raw_payloads = capture_raw_payloads
         self.loop_health_enabled = loop_health_enabled
         # Whitespace heartbeat for slow non-streaming completions: middleboxes
@@ -1657,22 +1677,39 @@ class ReverseProxy:
                 )
                 client = retry_client
             try:
-                resp = await client.request(method, url, content=content, headers=headers)
-                return resp
-            except _RETRYABLE_HTTP_ERRORS as exc:
-                last_exc = exc
-                if attempt < self.max_retries:
-                    logger.warning(
-                        "Transient HTTP error (attempt %d/%d, type=%s): %s",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        type(exc).__name__,
-                        exc,
-                    )
+                try:
+                    resp = await client.request(method, url, content=content, headers=headers)
+                except _RETRYABLE_HTTP_ERRORS as exc:
+                    last_exc = exc
+                    if attempt < self.max_retries:
+                        logger.warning(
+                            "Transient HTTP error (attempt %d/%d, type=%s): %s",
+                            attempt + 1,
+                            self.max_retries + 1,
+                            type(exc).__name__,
+                            exc,
+                        )
+                    continue
+
+                if resp.status_code not in _RETRY_STATUSES or attempt >= self.max_retries:
+                    return resp
+
+                delay = _retry_after_seconds(resp) or min(2.0**attempt, 30.0)
+                logger.warning(
+                    "Upstream returned %d (attempt %d/%d); retrying in %.1fs",
+                    resp.status_code,
+                    attempt + 1,
+                    self.max_retries + 1,
+                    delay,
+                )
+                await resp.aclose()
+                await asyncio.sleep(delay)
             finally:
                 if retry_client is not None:
                     await retry_client.aclose()
-        raise last_exc  # type: ignore[misc]
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("HTTP retry loop exhausted without a response")
 
     async def _persist(self, trace: TraceRecord) -> None:
         try:

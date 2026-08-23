@@ -9,6 +9,7 @@ from tinker_cookbook import model_info, renderers
 from tinker_cookbook.renderers import Message
 from typing_extensions import override  # need to use typing_extensions for python < 3.12
 
+from rllm.engine.rollout.httpx_utils import install_httpx_response_cycle_patch
 from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngine
 from rllm.engine.rollout.types import ImageProcessor, Processor, TinkerTokenInput, TinkerTokenOutput, TokenInput, Tokenizer, TokenOutput
 from rllm.parser import ChatTemplateParser
@@ -16,6 +17,8 @@ from rllm.tools.tool_base import ToolCall
 from rllm.types import TerminationEvent, TerminationReason
 
 logger = logging.getLogger(__name__)
+
+install_httpx_response_cycle_patch()
 
 """
 Utility functions for Tinker engine. Partly borrowed from
@@ -115,10 +118,13 @@ def _prepare_messages_with_tools(
     return prefix + remaining
 
 
-def _to_rllm_tool_calls(raw_tool_calls: list[Any]) -> list[ToolCall]:
+def _to_rllm_tool_calls(raw_tool_calls: list[Any] | None) -> list[ToolCall]:
     """Normalize every renderer's tool-call shape into rLLM ``ToolCall`` objects."""
     tool_calls = []
-    for tc in raw_tool_calls:
+    for tc in raw_tool_calls or []:
+        status = tc.get("status") if isinstance(tc, Mapping) else getattr(tc, "status", None)
+        if status is not None and getattr(status, "value", status) != "ok":
+            continue
         if isinstance(tc, ToolCall):
             tool_calls.append(tc)
             continue

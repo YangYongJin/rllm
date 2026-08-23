@@ -21,6 +21,7 @@ import shlex
 import tarfile
 import threading
 import time
+import uuid
 import weakref
 
 from rllm.env import env_float, env_int, rllm_run_id, sandbox_timeout_override_s
@@ -132,6 +133,24 @@ _CREATE_RATE_RPS = env_float("RLLM_MODAL_SANDBOX_CREATE_RPS", 4.0)
 _CREATE_BURST = env_float("RLLM_MODAL_SANDBOX_CREATE_BURST", 1.0)
 _CREATE_LIMITER = _CreateRateLimiter(_CREATE_RATE_RPS, _CREATE_BURST)
 
+# One App.lookup per app name per process. Modal rate-limits AppGetOrCreate
+# account-wide, and a run boots one sandbox per task (dozens concurrently), so
+# looking the app up in every constructor spends that quota re-fetching a value
+# that never changes — and the server-side throttle it triggers is retried with
+# an unbounded wait, which reads as a hung run during sandbox setup. The lock is
+# held across the RPC so a burst of constructors makes exactly one call.
+_APP_CACHE: dict[str, object] = {}
+_APP_CACHE_LOCK = threading.Lock()
+
+
+def _lookup_app(app_name: str):
+    import modal
+
+    with _APP_CACHE_LOCK:
+        if app_name not in _APP_CACHE:
+            _APP_CACHE[app_name] = modal.App.lookup(app_name, create_if_missing=True)
+        return _APP_CACHE[app_name]
+
 
 def _terminate_all_live() -> None:
     """atexit hook: terminate every still-alive ModalSandbox."""
@@ -214,12 +233,7 @@ class ModalSandbox:
         # A stored snapshot ref is a bare Modal image id ("im-…", no registry/tag);
         # the ":" / "/" guard keeps real docker images off the from_id path.
         from_snapshot = isinstance(image, str) and image.startswith("im-") and ":" not in image and "/" not in image
-        # App lookup may create the per-run App and is subject to the same
-        # account-wide create limit as Sandbox.create. Pace the whole create
-        # sequence so a concurrent batch cannot stampede AppGetOrCreate before
-        # reaching the limiter below.
-        _CREATE_LIMITER.acquire()
-        self._app = modal.App.lookup(self._app_name, create_if_missing=True)
+        self._app = _lookup_app(self._app_name)
 
         # A missing snapshot surfaces as NotFoundError either at from_id (if it
         # ever resolves eagerly) or at create; translate both so get_sandbox can
@@ -256,6 +270,7 @@ class ModalSandbox:
             # ``entrypoint`` kwarg.
             entrypoint = kwargs.pop("entrypoint", ["sh", "-c", "sleep infinity"])
 
+            _CREATE_LIMITER.acquire()
             self._sandbox = modal.Sandbox.create(*entrypoint, **create_kwargs)
         except modal.exception.NotFoundError as e:
             if from_snapshot:
@@ -364,21 +379,54 @@ class ModalSandbox:
     def upload_file(self, local_path: str, remote_path: str) -> None:
         """Upload a single file into the Modal sandbox.
 
-        Uses exec to write file contents since Modal's file API is in alpha.
+        Uses the SDK's filesystem API, falling back to base64 over exec. The
+        fallback was the only path when Modal's file API was in alpha; it costs a
+        33% size inflation and holds the payload as a string on both ends, so it
+        is now just the safety net.
         """
         remote_dir = os.path.dirname(remote_path)
         if remote_dir:
             self._exec_unchecked(f"mkdir -p {remote_dir}")
 
-        with open(local_path, "rb") as f:
-            content = f.read()
+        try:
+            self._sandbox.filesystem.copy_from_local(local_path, remote_path)
+            logger.debug("Uploaded %s -> %s in sandbox %s", local_path, remote_path, self.name)
+            return
+        except Exception as e:
+            logger.debug("Modal filesystem write failed for %s (%s); falling back to base64", remote_path, e)
 
-        # Use base64 encoding for safe binary transfer
         import base64
 
+        with open(local_path, "rb") as f:
+            content = f.read()
         b64 = base64.b64encode(content).decode("ascii")
         self._push_b64(b64, f"base64 -d > {remote_path}")
-        logger.debug("Uploaded %s -> %s in sandbox %s", local_path, remote_path, self.name)
+        logger.debug("Uploaded %s -> %s in sandbox %s (base64 fallback)", local_path, remote_path, self.name)
+
+    def download_file(self, remote_path: str) -> bytes:
+        """Read a file out of the Modal sandbox.
+
+        Prefers the SDK's filesystem API (a real binary read) and falls back to
+        base64 over exec, which is how ``upload_file`` goes the other way. Not
+        ``Sandbox.open()``: deprecated as of 2026-03-09 in favour of
+        ``Sandbox.filesystem``.
+        """
+        try:
+            return self._sandbox.filesystem.read_bytes(remote_path)
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            logger.debug("Modal filesystem read failed for %s (%s); falling back to base64", remote_path, e)
+
+        import base64
+        import shlex as _shlex
+
+        quoted = _shlex.quote(remote_path)
+        probe = self._exec_unchecked(f"test -f {quoted} && echo yes || echo no").strip()
+        if not probe.endswith("yes"):
+            raise FileNotFoundError(f"download_file: {remote_path} not found in sandbox {self.name}")
+        encoded = self._exec_unchecked(f"base64 {quoted} | tr -d '\\n'")
+        return base64.b64decode(encoded.strip())
 
     def upload_dir(self, local_path: str, remote_path: str) -> None:
         """Upload a directory tree into the Modal sandbox.
@@ -392,21 +440,32 @@ class ModalSandbox:
         if remote_parent:
             self._exec_unchecked(f"mkdir -p {remote_parent}")
 
-        # Create tar in memory
+        # Tar, not per-file writes: it carries modes, symlinks and empty dirs, and
+        # a truncated archive fails loudly (gzip CRC) instead of dropping files
+        # silently. Ship the archive with the filesystem API and extract in place;
+        # base64 over exec is the fallback.
         tar_buf = io.BytesIO()
         with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
             tar.add(local_path, arcname=remote_name)
-        tar_buf.seek(0)
+        archive = tar_buf.getvalue()
+
+        # --no-same-owner: don't restore the host's uid/gid (root extraction would
+        # otherwise chown to nonexistent ids and error); permissions are kept so
+        # executables stay +x.
+        staged = f"/tmp/.rllm-upload-{uuid.uuid4().hex[:8]}.tgz"
+        try:
+            self._sandbox.filesystem.write_bytes(archive, staged)
+            self._exec_unchecked(f"tar xzf {staged} --no-same-owner -C {remote_parent} && rm -f {staged}")
+            logger.debug("Uploaded dir %s -> %s in sandbox %s", local_path, remote_path, self.name)
+            return
+        except Exception as e:
+            logger.debug("Modal filesystem write failed for %s (%s); falling back to base64", staged, e)
 
         import base64
 
-        b64 = base64.b64encode(tar_buf.read()).decode("ascii")
-
-        # Write tar to sandbox and extract. --no-same-owner: don't restore the
-        # host's uid/gid (root extraction would otherwise chown to nonexistent
-        # ids and error); permissions are kept so executables stay +x.
+        b64 = base64.b64encode(archive).decode("ascii")
         self._push_b64(b64, f"base64 -d | tar xzf - --no-same-owner -C {remote_parent}")
-        logger.debug("Uploaded dir %s -> %s in sandbox %s", local_path, remote_path, self.name)
+        logger.debug("Uploaded dir %s -> %s in sandbox %s (base64 fallback)", local_path, remote_path, self.name)
 
     def is_alive(self) -> bool:
         """One API call: ``poll()`` returns ``None`` while the sandbox is still running.
@@ -506,7 +565,9 @@ def build_modal_snapshot(task, key: str, prior_ref: str | None = None, *, force:
     snapshot keyed on the install must actually contain it.
     """
     from rllm.eval._resolution import (
+        _builds_from_dockerfile,
         _create_base_sandbox,
+        _dockerfile_image,
         _dockerfile_run_commands,
         _replay_dockerfile,
         _should_replay_dockerfile,
@@ -516,17 +577,30 @@ def build_modal_snapshot(task, key: str, prior_ref: str | None = None, *, force:
         logger.info("modal snapshot %s already live (%s) — reusing", key, prior_ref)
         return prior_ref
 
+    # Mirrors build_daytona_snapshot: when the task builds from its real Dockerfile,
+    # the image already carries every RUN (plus COPY/ENV/WORKDIR), so replaying would
+    # double-apply them — and a snapshotted task must come out identical to a cold-built
+    # one. Only the install script layers on top.
+    dockerfile = _builds_from_dockerfile(task, "modal")
+
     # Size the build sandbox's lifetime to the worst-case replay: each RUN is
     # bounded at 900s (a step that hangs against a prebuilt image burns its
     # full bound), plus the install bound and pull/capture slack — floored at
     # the rollout default. Without this floor, two hung steps killed the
-    # sandbox mid-build.
+    # sandbox mid-build. A from_dockerfile build replays nothing.
     install_budget = env_int("RLLM_HARNESS_INSTALL_TIMEOUT_S", 900) if install_script else 0
-    n_replay = len(_dockerfile_run_commands(task)) if _should_replay_dockerfile(task) else 0
+    n_replay = 0 if dockerfile is not None else (len(_dockerfile_run_commands(task)) if _should_replay_dockerfile(task) else 0)
     build_timeout = max(_default_sandbox_timeout(), 900 * n_replay + install_budget + 600)
-    sb = _create_base_sandbox(task, "modal", name=f"{key}-build", timeout=build_timeout)
+    sb = _create_base_sandbox(
+        task,
+        "modal",
+        image=_dockerfile_image("modal", dockerfile) if dockerfile is not None else None,
+        name=f"{key}-build",
+        timeout=build_timeout,
+    )
     try:
-        _replay_dockerfile(task, sb, "modal")
+        if dockerfile is None:
+            _replay_dockerfile(task, sb, "modal")
         if install_script:
             sb.exec(install_script, timeout=env_int("RLLM_HARNESS_INSTALL_TIMEOUT_S", 900), user="root")
         image = sb._sandbox.snapshot_filesystem()  # noqa: SLF001 — modal.Image
