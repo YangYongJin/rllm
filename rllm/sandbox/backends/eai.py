@@ -151,9 +151,10 @@ class EAISandbox:
         """
         if user is not None:
             logger.debug("EAISandbox %s: ignoring user=%r (jobs run as a fixed uid)", self.name, user)
-        remote = "export HOME=/tmp; " + command
+        wrapped = "export HOME=/tmp; " + command
+        remote = wrapped
         if timeout is not None:
-            remote = f"timeout {int(timeout)} bash -c {_shquote(command)}"
+            remote = f"timeout {int(timeout)} bash -c {_shquote(wrapped)}"
         proc = _eai(
             "job", "exec", self.job_id, "--", "bash", "-c", remote,
             timeout=(timeout + 60) if timeout is not None else 3600,
