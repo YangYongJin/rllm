@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import random
+import math
 import threading
 import time
 import uuid
@@ -46,6 +47,10 @@ def controller_from_env() -> "ContinuationController | None":
         return None
     return ContinuationController(
         mode=os.environ.get("RLLM_CONTROLLER_MODE", "random"),
+        head_path=os.environ.get("RLLM_CONTROLLER_HEAD") or None,
+        lam=float(os.environ.get("RLLM_CONTROLLER_LAMBDA", "0.3")),
+        temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
+        p_min=float(os.environ.get("RLLM_CONTROLLER_P_MIN", "0.05")),
         p_stop=float(os.environ.get("RLLM_CONTROLLER_P_STOP", "0.15")),
         audit_fraction=float(os.environ.get("RLLM_CONTROLLER_AUDIT_FRACTION", "0.1")),
         min_turns=int(os.environ.get("RLLM_CONTROLLER_MIN_TURNS", "2")),
@@ -58,14 +63,25 @@ class ContinuationController:
     def __init__(
         self,
         mode: str = "random",
+        head_path: str | None = None,
+        lam: float = 0.3,
+        temperature: float = 0.15,
+        p_min: float = 0.05,
         p_stop: float = 0.15,
         audit_fraction: float = 0.1,
         min_turns: int = 2,
         decision_log_dir: str | None = None,
         seed: int | None = None,
     ) -> None:
-        assert mode in ("random",), f"unsupported controller mode: {mode}"
+        assert mode in ("random", "learned"), f"unsupported controller mode: {mode}"
         self.mode = mode
+        self.lam, self.temperature, self.p_min = lam, temperature, p_min
+        self._head = None
+        if mode == "learned":
+            with open(head_path) as f:
+                self._head = json.load(f)
+            self._b_x: dict[str, list[float]] = {}  # repo -> [solves, total] success EMA basis
+            self._turn_costs: list[int] = []  # completed-session turn counts (C estimate)
         self.p_stop = p_stop
         self.audit_fraction = audit_fraction
         self.min_turns = min_turns
@@ -91,9 +107,26 @@ class ContinuationController:
             return st
 
     def _continue_prob(self, st: dict[str, Any]) -> float:
-        # v0 random mode: constant. The learned head (V_c vs lambda*C through a
-        # sigmoid, p_min floor) replaces this method's body.
-        return 1.0 - self.p_stop
+        if self.mode == "random" or self._head is None:
+            return 1.0 - self.p_stop
+        # Learned mode (PROJECT_BRIEF §4.2/§4.6):
+        #   p_hat = sigmoid(head(features));  V_c = p_hat*(1-b) + (1-p_hat)*b
+        #   C     = expected remaining turns / cap (EWMA over completed sessions)
+        #   s_t   = p_min + (1-p_min) * sigmoid((V_c - lam*C) / T)
+        h = self._head
+        feats = st.get("features") or {}
+        x = [(float(feats.get(k, 0.0)) - m) / s_ for k, m, s_ in zip(h["feature_names"], h["mu"], h["sd"])]
+        z = sum(wi * xi for wi, xi in zip(h["weights"], x)) + h["bias"]
+        p_hat = 1.0 / (1.0 + math.exp(-z))
+        repo = st.get("repo", "unknown")
+        solved, total = self._b_x.get(repo, [0.0, 0.0])
+        b = (solved + 1.0) / (total + 8.0)  # smoothed per-repo success rate
+        v_c = p_hat * (1.0 - b) + (1.0 - p_hat) * b
+        mean_turns = (sum(self._turn_costs) / len(self._turn_costs)) if self._turn_costs else 12.0
+        remaining = max(0.0, mean_turns - st["turn"]) / max(mean_turns, 1.0)
+        z2 = (v_c - self.lam * remaining) / self.temperature
+        z2 = max(-30.0, min(30.0, z2))
+        return self.p_min + (1.0 - self.p_min) * (1.0 / (1.0 + math.exp(-z2)))
 
     # ------------------------------------------------------------------
     def on_turn(self, session_id: str, request_body: dict[str, Any]) -> dict[str, Any] | None:
@@ -102,6 +135,8 @@ class ContinuationController:
         st = self._session(session_id)
         st["turn"] += 1
         turn = st["turn"]
+        if self.mode == "learned":
+            self._update_features(st, session_id, request_body)
 
         s_t = self._continue_prob(st)
         eligible = turn > self.min_turns and not st["stopped"]
@@ -132,6 +167,46 @@ class ContinuationController:
         return self._terminal_response(request_body)
 
     # ------------------------------------------------------------------
+    _REPOS = ("aiohttp", "coveragepy", "datalad", "numpy", "orange3", "pandas", "pillow", "pyramid", "scrapy", "tornado")
+
+    def _update_features(self, st: dict[str, Any], session_id: str, request_body: dict[str, Any]) -> None:
+        """Cheap prefix features mirroring controller/featurize.py (char-based)."""
+        msgs = request_body.get("messages") or []
+        gen = sum(len(str(m.get("content") or "")) for m in msgs if m.get("role") == "assistant")
+        obs = sum(len(str(m.get("content") or "")) for m in msgs if m.get("role") in ("tool", "user"))
+        turn = st["turn"]
+        if "repo" not in st:
+            st["repo"] = next((r for r in self._REPOS if r in session_id), "unknown")
+        last_gen = gen - st.get("_prev_gen", 0)
+        last_obs = obs - st.get("_prev_obs", 0)
+        st["_prev_gen"], st["_prev_obs"] = gen, obs
+        feats = {
+            "turn": float(turn),
+            "frac_of_cap": turn / 40.0,
+            "cum_gen_chars": float(gen),
+            "cum_obs_chars": float(obs),
+            "last_gen_chars": float(max(0, last_gen)),
+            "last_obs_chars": float(max(0, last_obs)),
+            "gen_rate": gen / max(1, turn),
+        }
+        for r in self._REPOS:
+            feats[f"repo_{r}"] = 1.0 if r == st["repo"] else 0.0
+        st["features"] = feats
+
+    def observe_outcome(self, session_id: str, solved: bool, turns: int) -> None:
+        """Optional online feedback (b(x) + cost stats). Called out-of-band."""
+        if self.mode != "learned":
+            return
+        with self._lock:
+            st = self._sessions.get(session_id) or {}
+            repo = st.get("repo", "unknown")
+            rec = self._b_x.setdefault(repo, [0.0, 0.0])
+            rec[0] += 1.0 if solved else 0.0
+            rec[1] += 1.0
+            self._turn_costs.append(turns)
+            if len(self._turn_costs) > 500:
+                self._turn_costs = self._turn_costs[-500:]
+
     def _terminal_response(self, request_body: dict[str, Any]) -> dict[str, Any]:
         """OpenAI-format response carrying the harness's own exit action."""
         return {
