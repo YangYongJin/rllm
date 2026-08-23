@@ -108,7 +108,16 @@ class EAISandbox:
             "--field", "id", "--no-header", "--format", "csv",
             "--", "sleep", "infinity",
         ]
-        proc = _eai(*args, timeout=180)
+        proc = None
+        for attempt in range(4):
+            proc = _eai(*args, timeout=180)
+            if proc.returncode == 0:
+                break
+            # EAI API 5xx blips are transient; back off and retry.
+            if attempt < 3 and any(t in (proc.stderr or "") for t in ("502", "503", "504", "server-side error", "no response")):
+                time.sleep(5 * (attempt + 1))
+                continue
+            break
         if proc.returncode != 0:
             raise RuntimeError(f"EAISandbox {name}: job submission failed: {proc.stderr.strip()[:500]}")
         self.job_id = proc.stdout.strip().splitlines()[-1].strip()
