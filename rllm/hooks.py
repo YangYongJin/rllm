@@ -243,7 +243,7 @@ class SandboxTaskHooks:
         return self._registry
 
     def setup(self, task: Task, agent_flow: AgentFlow, uid: str) -> TaskContext:
-        from rllm.engine.agentflow_engine import TaskContext
+        from rllm.engine.agentflow_engine import AgentSetupTimeoutError, TaskContext
         from rllm.eval._resolution import _resolve_backend, _run_healthcheck, _setup_task_environment
 
         plan = resolve_rollout_plan(task, agent_flow, self.evaluation)
@@ -253,6 +253,7 @@ class SandboxTaskHooks:
         try:
             if plan.needs_env:
                 from rllm.env import env_int
+                from rllm.sandbox.protocol import SandboxCommandTimeout
                 from rllm.sandbox.snapshot import get_sandbox, install_script_for
 
                 install = install_script_for(agent_flow)
@@ -264,6 +265,10 @@ class SandboxTaskHooks:
                 if install and getattr(sandbox, "baked_install", "") != install:
                     try:
                         sandbox.exec(install, timeout=getattr(agent_flow, "install_timeout", env_int("RLLM_HARNESS_INSTALL_TIMEOUT_S", 600)), user="root")
+                    except SandboxCommandTimeout as e:
+                        raise AgentSetupTimeoutError(
+                            f"Failed to install {getattr(agent_flow, 'name', type(agent_flow).__name__)} within the configured timeout"
+                        ) from e
                     except Exception as e:
                         raise RuntimeError(f"Failed to install {getattr(agent_flow, 'name', type(agent_flow).__name__)} in sandbox: {e}") from e
 

@@ -493,6 +493,31 @@ class FireworksPolicyTrainer:
             vocab_size=self._get_vocab_size(),
         )
 
+        sequence_lengths = [int(datum.model_input.length) for datum in raw_datums]
+        if sequence_lengths:
+            min_sequence_length = min(sequence_lengths)
+            max_sequence_length = max(sequence_lengths)
+            mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
+            adv_metrics["batch/sequence_length/min"] = min_sequence_length
+            adv_metrics["batch/sequence_length/max"] = max_sequence_length
+            adv_metrics["batch/sequence_length/mean"] = mean_sequence_length
+
+            configured_max_length = OmegaConf.select(self.config, "training.max_length")
+            if configured_max_length is not None:
+                configured_max_length = int(configured_max_length)
+                overlength_count = sum(length > configured_max_length for length in sequence_lengths)
+                if overlength_count:
+                    logger.warning(
+                        "%d/%d Fireworks training sequences exceed training.max_length=%d after transform "
+                        "(min=%d, mean=%.1f, max=%d); submitting them unchanged",
+                        overlength_count,
+                        len(sequence_lengths),
+                        configured_max_length,
+                        min_sequence_length,
+                        mean_sequence_length,
+                        max_sequence_length,
+                    )
+
         # Whole batch dropped as malformed (e.g. empty logprobs from overloaded generations).
         # forward_backward([]) would raise; skip the pass (the training loop then skips optim +
         # weight sync when no sequences are produced).

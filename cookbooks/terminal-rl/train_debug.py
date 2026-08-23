@@ -14,7 +14,8 @@ TRAIN_DATASET = os.environ.get("TB_TRAIN_DATASET", "tb_v2_debug")
 # Terminal-Bench eval version (Harbor registry). Must match prepare_data.py;
 # both read TB_EVAL_VERSION so the pulled and loaded dataset names agree.
 EVAL_VERSION = os.environ.get("TB_EVAL_VERSION", "2.0")
-VAL_DATASET = f"terminal-bench@{EVAL_VERSION}"
+VAL_DATASET = os.environ.get("TB_TEST_DATASET", f"terminal-bench@{EVAL_VERSION}")
+VAL_SPLIT = os.environ.get("TB_TEST_SPLIT", "default")
 
 # Sandbox backend for the SandboxedAgentFlow path: docker | local | modal | daytona.
 SANDBOX_BACKEND = os.environ.get("TERMINAL_SANDBOX_BACKEND", "modal")
@@ -45,7 +46,7 @@ if MINISWE_COMMAND_TIMEOUT <= 0:
 @hydra.main(config_path="pkg://rllm.trainer.config", config_name="unified", version_base=None)
 def main(config: DictConfig) -> None:
     train_dataset = DatasetRegistry.load_dataset(TRAIN_DATASET, "train")
-    val_dataset = DatasetRegistry.load_dataset(VAL_DATASET, "default")
+    val_dataset = DatasetRegistry.load_dataset(VAL_DATASET, VAL_SPLIT)
 
     if train_dataset is None:
         raise RuntimeError(f"Dataset '{TRAIN_DATASET}' not found. Run: python cookbooks/terminal-rl/prepare_data.py")

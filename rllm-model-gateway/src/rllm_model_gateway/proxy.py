@@ -52,6 +52,12 @@ _HOP_BY_HOP = frozenset(
 )
 
 _MAX_ABORT_RESUMES = 3
+_RETRYABLE_HTTP_ERRORS = (
+    httpx.ReadError,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+    httpx.TimeoutException,
+)
 
 
 def _strip_logprobs(response: dict[str, Any]) -> dict[str, Any]:
@@ -214,6 +220,7 @@ def _build_trace_data(
     capture_raw: bool,
     lineage_id: str | None = None,
     trace_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     """Build a TraceRecord and serialize it to a dict.
 
@@ -228,12 +235,28 @@ def _build_trace_data(
         request_body,
         response_body,
         latency_ms,
+        metadata=metadata,
         weight_version=weight_version,
         lineage_id=lineage_id,
         trace_id=trace_id,
         capture_raw=capture_raw,
     )
     return trace.trace_id, trace.session_id, trace.model_dump()
+
+
+def _context_limit_metadata(
+    request_body: dict[str, Any],
+    completions_body: dict[str, Any],
+) -> dict[str, Any]:
+    requested = request_body.get("max_tokens")
+    effective = completions_body.get("max_tokens")
+    if not isinstance(requested, int) or not isinstance(effective, int) or effective >= requested:
+        return {}
+    return {
+        "max_tokens_clamped": True,
+        "requested_max_tokens": requested,
+        "effective_max_tokens": effective,
+    }
 
 
 class ReverseProxy:
@@ -904,7 +927,16 @@ class ReverseProxy:
         response_body["object"] = "chat.completion"
 
         if session_id and response_body:
-            await self._persist_trace(session_id, request_body, response_body, latency_ms, request.state.weight_version, self._request_lineage_id(request), self._turn_trace_id(acc, replay))
+            await self._persist_trace(
+                session_id,
+                request_body,
+                response_body,
+                latency_ms,
+                request.state.weight_version,
+                self._request_lineage_id(request),
+                self._turn_trace_id(acc, replay),
+                metadata=_context_limit_metadata(request_body, completions_body),
+            )
 
         sanitized = response_body
         if isinstance(response_body, dict) and response_body:
@@ -953,7 +985,7 @@ class ReverseProxy:
         retry_client: httpx.AsyncClient | None = None
         try:
             resp = await upstream.__aenter__()
-        except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as first_exc:
+        except _RETRYABLE_HTTP_ERRORS as first_exc:
             logger.warning(
                 "Cumulative streaming connection error to %s (type=%s). Retrying.",
                 url,
@@ -995,6 +1027,7 @@ class ReverseProxy:
                 request_body,
                 chunks,
                 latency_ms,
+                metadata=_context_limit_metadata(request_body, completions_body),
                 weight_version=request.state.weight_version,
                 lineage_id=self._request_lineage_id(request),
                 trace_id=stream_trace_id,
@@ -1177,6 +1210,7 @@ class ReverseProxy:
                 request_body,
                 chat_body,
                 latency_ms,
+                metadata=_context_limit_metadata(request_body, completions_body),
                 weight_version=request.state.weight_version,
                 lineage_id=self._request_lineage_id(request),
                 trace_id=self._turn_trace_id(acc, replay),
@@ -1275,7 +1309,7 @@ class ReverseProxy:
         retry_client: httpx.AsyncClient | None = None
         try:
             resp = await upstream.__aenter__()
-        except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as first_exc:
+        except _RETRYABLE_HTTP_ERRORS as first_exc:
             logger.warning(
                 "Connection error to %s (type=%s, msg=%s). Retrying with a fresh connection.",
                 url,
@@ -1613,18 +1647,31 @@ class ReverseProxy:
         assert self._http is not None
         last_exc: Exception | None = None
         for attempt in range(1 + self.max_retries):
+            retry_client: httpx.AsyncClient | None = None
+            client = self._http
+            if attempt > 0:
+                retry_client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(timeout=None),
+                    limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+                    follow_redirects=True,
+                )
+                client = retry_client
             try:
-                resp = await self._http.request(method, url, content=content, headers=headers)
+                resp = await client.request(method, url, content=content, headers=headers)
                 return resp
-            except httpx.ConnectError as exc:
+            except _RETRYABLE_HTTP_ERRORS as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
                     logger.warning(
-                        "Connection error (attempt %d/%d): %s",
+                        "Transient HTTP error (attempt %d/%d, type=%s): %s",
                         attempt + 1,
                         self.max_retries + 1,
+                        type(exc).__name__,
                         exc,
                     )
+            finally:
+                if retry_client is not None:
+                    await retry_client.aclose()
         raise last_exc  # type: ignore[misc]
 
     async def _persist(self, trace: TraceRecord) -> None:
@@ -1654,6 +1701,7 @@ class ReverseProxy:
         weight_version: int | None,
         lineage_id: str | None = None,
         trace_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Build + store a trace off the event-loop thread and off the response
         critical path.
@@ -1680,6 +1728,7 @@ class ReverseProxy:
                     capture_raw,
                     lineage_id,
                     trace_id,
+                    metadata,
                 )
                 await self._safe_store(built_trace_id, sess, data)
             except Exception:

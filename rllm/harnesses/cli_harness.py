@@ -68,12 +68,6 @@ class BaseCliHarness(SandboxedAgentFlow):
     # Per-call timeouts (seconds). Tasks may override via metadata.
     install_timeout: int = env_int("RLLM_HARNESS_INSTALL_TIMEOUT_S", 600)  # set env var: export RLLM_HARNESS_INSTALL_TIMEOUT_S=xxx
     run_timeout: int = env_int("RLLM_HARNESS_RUN_TIMEOUT_S", 3600)  # set env var: export RLLM_HARNESS_RUN_TIMEOUT_S=xxx
-    # When an operator sets RLLM_HARNESS_RUN_TIMEOUT_S (or --agent-timeout),
-    # run_timeout is a hard CEILING on the per-task ``agent_timeout``, not just a
-    # fallback — effective timeout = min(agent_timeout, run_timeout). When it is
-    # unset, the task's own agent_timeout governs (so eval honors each
-    # benchmark's per-task budget). Captured at import; configure() flips it on.
-    run_timeout_is_cap: bool = "RLLM_HARNESS_RUN_TIMEOUT_S" in os.environ
     # Grace added to the *exec* timeout over the agent's budget so an in-sandbox
     # driver that self-limits at the budget (terminus2) has time to record its
     # outcome and exit cleanly before the backend SIGKILLs the exec. The agent
@@ -94,7 +88,6 @@ class BaseCliHarness(SandboxedAgentFlow):
         timeout = leftovers.pop("agent_timeout", None)
         if timeout is not None:
             self.run_timeout = int(timeout)
-            self.run_timeout_is_cap = True  # an explicit --agent-timeout is a hard ceiling
         return leftovers
 
     # ---------------------------------------------------------------------
@@ -125,18 +118,13 @@ class BaseCliHarness(SandboxedAgentFlow):
     def _effective_timeout(self, task: Task) -> float:
         """The agent's wall-clock budget for this task, in seconds.
 
-        The task's own ``agent_timeout`` applies, but an operator-set
-        ``RLLM_HARNESS_RUN_TIMEOUT_S`` / ``--agent-timeout`` is a hard ceiling
-        over it (``run_timeout_is_cap``). Shared by :meth:`run` (to size the
-        exec timeout + classify a wall-clock kill) and by harnesses that hand
-        the same budget to an in-sandbox driver.
+        Precedence is environment, task metadata, then the harness default.
         """
+        configured = os.environ.get("RLLM_HARNESS_RUN_TIMEOUT_S")
+        if configured is not None:
+            return float(configured)
         per_task = task.metadata.get("agent_timeout")
-        if per_task is None:
-            return float(self.run_timeout)
-        if self.run_timeout_is_cap:
-            return min(float(per_task), float(self.run_timeout))
-        return float(per_task)
+        return float(per_task) if per_task is not None else float(self.run_timeout)
 
     def _read_outcome(self, sandbox: Sandbox) -> dict | None:
         """Structured outcome an in-sandbox driver may have written.
@@ -430,7 +418,7 @@ class BaseCliHarness(SandboxedAgentFlow):
                         reason = TerminationReason.SANDBOX_ERROR
                 except Exception:  # is_alive must not raise, but never let the probe mask the real failure
                     logger.debug("is_alive probe raised after exec failure", exc_info=True)
-            logger.warning("%s execution failed (%s): %s", type(self).__name__, reason.value, e)
+            logger.debug("%s execution failed (%s): %s", type(self).__name__, reason.value, e)
             return self._outcome_episode(
                 task,
                 termination_reason=reason,

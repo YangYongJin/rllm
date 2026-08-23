@@ -53,6 +53,10 @@ logger = logging.getLogger(__name__)
 _MIN_FD_LIMIT = 8192
 
 
+class AgentSetupTimeoutError(asyncio.TimeoutError):
+    pass
+
+
 def _log_error_termination(uid: str, episode: Episode) -> None:
     if episode.termination_reason != TerminationReason.ERROR:
         return
@@ -71,16 +75,32 @@ def _log_error_termination(uid: str, episode: Episode) -> None:
 
 
 def _step_returned_nothing(step) -> bool:
-    """True when a model call produced no usable output — empty content AND no tool
-    calls. A dead/erroring upstream (proxy down, API failure) looks like this; a
-    legitimate tool-only turn does not (it carries ``tool_calls``)."""
-    content = (getattr(step.model_output, "content", None) or "").strip() if getattr(step, "model_output", None) else ""
-    if content:
+    """Return whether a model call produced no evidence of usable output."""
+    model_output = getattr(step, "model_output", None)
+    text_fields = (
+        getattr(model_output, "content", None),
+        getattr(model_output, "text", None),
+        getattr(model_output, "reasoning", None),
+        getattr(step, "model_response", None),
+        getattr(step, "thought", None),
+    )
+    if any(isinstance(value, str) and value.strip() for value in text_fields):
+        return False
+    if getattr(model_output, "tool_calls", None) or getattr(model_output, "completion_ids", None):
         return False
     msgs = getattr(step, "chat_completions", None)
     last = msgs[-1] if msgs else None
-    tool_calls = last.get("tool_calls") if isinstance(last, dict) else None
-    return not tool_calls
+    if isinstance(last, dict):
+        message_fields = (last.get("content"), last.get("reasoning"), last.get("reasoning_content"))
+        if any(isinstance(value, str) and value.strip() for value in message_fields):
+            return False
+        if last.get("tool_calls"):
+            return False
+    return True
+
+
+def _all_steps_returned_nothing(steps) -> bool:
+    return bool(steps) and all(_step_returned_nothing(step) for step in steps)
 
 
 def _no_usable_model_output(episode: Episode) -> bool:
@@ -90,7 +110,7 @@ def _no_usable_model_output(episode: Episode) -> bool:
     or tunnel failure) — which otherwise looks identical to a clean ENV_DONE with
     reward 0. A legit failed rollout has real completions, so it isn't flagged."""
     steps = [s for traj in episode.trajectories for s in traj.steps]
-    return not steps or all(_step_returned_nothing(s) for s in steps)
+    return not steps or _all_steps_returned_nothing(steps)
 
 
 class EnrichMismatchError(RuntimeError):
@@ -200,6 +220,15 @@ def enrich_episode_with_traces(
             artifacts=episode.artifacts,
         )
 
+    termination_reason = episode.termination_reason
+    final_trace = traces[-1]
+    if (
+        termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED
+        and final_trace.finish_reason == "length"
+        and final_trace.metadata.get("max_tokens_clamped") is True
+    ):
+        termination_reason = TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED
+
     # Convert all traces to training steps
     training_steps = [trace_record_to_step(t) for t in traces]
 
@@ -302,7 +331,7 @@ def enrich_episode_with_traces(
         trajectories=enriched_trajectories,
         metrics=metrics,
         metadata=episode.metadata,
-        termination_reason=episode.termination_reason,
+        termination_reason=termination_reason,
         artifacts=episode.artifacts,
     )
 
@@ -540,11 +569,11 @@ class AgentFlowEngine:
                 # run silently produces garbage (every rollout scores 0).
                 if episode is not None:
                     _steps = [s for t in (episode.trajectories or []) for s in (t.steps or [])]
-                    if _steps and all(not (s.model_response or "").strip() for s in _steps):
+                    if _all_steps_returned_nothing(_steps):
                         n_empty_rollouts += 1
                         colorful_print(
                             f"[{task_id}:{rollout_idx}] ⚠️  EMPTY COMPLETIONS: all {len(_steps)} LLM calls "
-                            f"returned 0 tokens — upstream likely DOWN (dead litellm proxy :4000 / gateway "
+                            f"returned no usable model output — upstream likely DOWN (dead litellm proxy :4000 / gateway "
                             f"no-healthy-workers / model). [{n_empty_rollouts} empty rollouts so far]",
                             fg="red",
                         )
@@ -554,11 +583,11 @@ class AgentFlowEngine:
                 if episode is not None and episode.trajectories and episode.trajectories[0].reward is not None:
                     reward_sum += float(episode.trajectories[0].reward)
                     n_scored += 1
-                pbar.update(1)
                 postfix = f"acc {n_correct}/{done}={100.0 * n_correct / done:.1f}%"
                 if n_scored:
                     postfix += f" reward={reward_sum / n_scored:.3f}"
-                pbar.set_postfix_str(postfix)
+                pbar.set_postfix_str(postfix, refresh=False)
+                pbar.update(1)
 
                 # Task-group summary: fires once the group's last rollout lands.
                 # Only multi-rollout groups are tracked (singletons add nothing over
@@ -749,15 +778,41 @@ class AgentFlowEngine:
             _timings = {}
 
         # Offload hook setup (blocking Modal/docker I/O) to the executor.
+        from rllm.env import env_int
+
         t = time.perf_counter()
+        setup_timeout = env_int("RLLM_HARNESS_SETUP_TIMEOUT_S", 0)
+        setup_future = loop.run_in_executor(
+            self.executor,
+            self.hooks.setup,
+            task_obj,
+            self.agent_flow,
+            uid,
+        )
         try:
-            ctx: TaskContext = await loop.run_in_executor(
-                self.executor,
-                self.hooks.setup,
-                task_obj,
-                self.agent_flow,
-                uid,
-            )
+            if setup_timeout > 0:
+                try:
+                    ctx: TaskContext = await asyncio.wait_for(asyncio.shield(setup_future), timeout=setup_timeout)
+                except asyncio.TimeoutError as exc:
+                    # A running executor thread cannot be cancelled. If setup
+                    # eventually returns, tear down its context so the sandbox
+                    # is not leaked after the rollout has already moved on.
+                    def teardown_late_setup(done) -> None:
+                        try:
+                            late_ctx = done.result()
+                        except BaseException:
+                            return
+                        try:
+                            self.executor.submit(late_ctx.run_teardown)
+                        except RuntimeError:
+                            logger.warning("[%s] late setup completed after executor shutdown; sandbox cleanup may be deferred", uid)
+
+                    setup_future.add_done_callback(teardown_late_setup)
+                    error = AgentSetupTimeoutError(f"Agent setup timed out after {setup_timeout}s")
+                    error._rllm_termination_reason = TerminationReason.AGENT_SETUP_TIMEOUT
+                    raise error from exc
+            else:
+                ctx = await setup_future
         except BaseException as e:
             # Setup is sandbox provisioning + per-task verifier resolution — a
             # failure here is infra, not the policy. Tag it so the retry path
@@ -765,7 +820,7 @@ class AgentFlowEngine:
             # exception name already maps to a more specific reason).
             try:
                 if getattr(e, "_rllm_termination_reason", None) is None:
-                    e._rllm_termination_reason = TerminationReason.SANDBOX_ERROR
+                    e._rllm_termination_reason = termination_reason_from_error(type(e).__name__, default=TerminationReason.SANDBOX_ERROR)
             except Exception:
                 pass
             raise
