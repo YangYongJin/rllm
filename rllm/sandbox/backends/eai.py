@@ -55,6 +55,18 @@ TRANSFER_REMOTE_DIR = "/mnt/rc_transfer"
 
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"}
 
+# CLI failures worth retrying. Beyond control-plane 5xx, this includes
+# "token is invalid": the eai session credentials rotate periodically, and
+# every process invoking the CLI during that window gets a hard auth error
+# even though the session is healthy seconds later (observed 2026-08-25
+# 20:26 UTC — one rotation killed a training run and four eval jobs, because
+# auth errors were classified non-transient and failed on the first try).
+# A genuinely expired session still fails, just after the ladder runs out.
+_TRANSIENT_ERRS = (
+    "502", "503", "504", "http: 500", "server-side error", "internal error",
+    "no response", "token is invalid", "context deadline exceeded",
+)
+
 # A sandbox's max-run-time IS the lifetime of a leaked sandbox (nothing else
 # reclaims one whose owner died). Observed episodes finish in <15 min, so 2 h
 # leaves a wide margin while cutting the cost of each leak 3x vs the old 6 h.
@@ -146,7 +158,7 @@ class EAISandbox:
             # EAI API 5xx blips are transient; back off and retry. Ladder
             # totals ~10 min to ride out multi-minute control-plane flaps
             # (observed 2026-08-23 and 2026-08-25).
-            if attempt < 6 and any(t in (proc.stderr or "") for t in ("502", "503", "504", "server-side error", "no response")):
+            if attempt < 6 and any(t in (proc.stderr or "") for t in _TRANSIENT_ERRS):
                 time.sleep(min(300, 10 * 2**attempt))
                 continue
             break
@@ -200,7 +212,7 @@ class EAISandbox:
             # never started; exit 7 = transport error before execution.
             # Ladder totals ~5 min for multi-minute control-plane flaps.
             err = proc.stderr or ""
-            transient = any(t in err for t in ("http: 500", "internal error", "502", "503", "504", "no response"))
+            transient = any(t in err for t in _TRANSIENT_ERRS)
             if attempt < 5 and transient and proc.returncode in (1, 7):
                 time.sleep(min(120, 8 * 2**attempt))
                 continue
@@ -280,7 +292,7 @@ class EAISandbox:
                 if "cannot cancel a job that is in state" in low or "not found" in low:
                     killed = True
                     break
-                if not any(t in last_err for t in ("502", "503", "504", "http: 500", "internal error", "no response")):
+                if not any(t in last_err for t in _TRANSIENT_ERRS):
                     break  # non-transient: retrying will not help
             if attempt < 3:
                 time.sleep(5 * 2**attempt)
