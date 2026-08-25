@@ -50,6 +50,7 @@ def controller_from_env() -> "ContinuationController | None":
         head_path=os.environ.get("RLLM_CONTROLLER_HEAD") or None,
         lam=float(os.environ.get("RLLM_CONTROLLER_LAMBDA", "0.3")),
         beta=float(os.environ.get("RLLM_CONTROLLER_BETA", "0.0")),
+        online_stats=os.environ.get("RLLM_CONTROLLER_ONLINE_STATS", "0") in ("1", "true", "True"),
         temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
         p_min=float(os.environ.get("RLLM_CONTROLLER_P_MIN", "0.05")),
         p_stop=float(os.environ.get("RLLM_CONTROLLER_P_STOP", "0.15")),
@@ -67,6 +68,7 @@ class ContinuationController:
         head_path: str | None = None,
         lam: float = 0.3,
         beta: float = 0.0,
+        online_stats: bool = False,
         temperature: float = 0.15,
         p_min: float = 0.05,
         p_stop: float = 0.15,
@@ -78,6 +80,9 @@ class ContinuationController:
         assert mode in ("random", "learned"), f"unsupported controller mode: {mode}"
         self.mode = mode
         self.lam, self.beta, self.temperature, self.p_min = lam, beta, temperature, p_min
+        # OFF by default: observe_outcome() had no caller until 2026-08-25, so
+        # every run to date used the frozen priors. Keep that reproducible.
+        self.online_stats = online_stats
         self._head = None
         if mode == "learned":
             with open(head_path) as f:
@@ -204,12 +209,22 @@ class ContinuationController:
         st["features"] = feats
 
     def observe_outcome(self, session_id: str, solved: bool, turns: int) -> None:
-        """Optional online feedback (b(x) + cost stats). Called out-of-band."""
-        if self.mode != "learned":
+        """Online feedback: update b(x) and the remaining-turn cost estimate.
+
+        Fed by the engine via POST /controller/outcome after each episode is
+        graded. Gated on ``online_stats`` so an existing run's operating point
+        stays reproducible: with it OFF, b(x) stays at its 0.125 prior and
+        mean_turns at 12.0 (that is what method_9b_v1 ran).
+        """
+        if self.mode != "learned" or not self.online_stats:
             return
+        if session_id.endswith(":val"):
+            return  # validation must not steer the training-time controller
         with self._lock:
             st = self._sessions.get(session_id) or {}
-            repo = st.get("repo", "unknown")
+            # Derive the repo from the session id rather than session state:
+            # state may already have been evicted by the time grading finishes.
+            repo = st.get("repo") or next((r for r in self._REPOS if r in session_id), "unknown")
             rec = self._b_x.setdefault(repo, [0.0, 0.0])
             rec[0] += 1.0 if solved else 0.0
             rec[1] += 1.0

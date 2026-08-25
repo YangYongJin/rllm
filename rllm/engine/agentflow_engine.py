@@ -576,6 +576,16 @@ class AgentFlowEngine:
                 _timings=timings,
             )
             enriched.metrics.update(timings)
+            # Close the continuation controller's feedback loop: it needs graded
+            # outcomes to update b(x) and its remaining-turn cost estimate. The
+            # gateway ignores this unless RLLM_CONTROLLER_ONLINE_STATS=1, and
+            # report_outcome never raises, so this is inert for other runs.
+            if not is_validation:
+                try:
+                    n_turns = int(enriched.metrics.get("n_turns", 0) or 0)
+                    await self.gateway.report_outcome(uid, bool(enriched.is_correct), n_turns)
+                except Exception:
+                    logger.debug("[%s] controller outcome report failed", uid, exc_info=True)
             result_holder["episode"] = enriched
             return enriched
         finally:

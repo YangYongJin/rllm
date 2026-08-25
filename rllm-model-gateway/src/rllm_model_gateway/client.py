@@ -218,6 +218,22 @@ class AsyncGatewayClient:
         resp.raise_for_status()
         return resp.json().get("deleted", 0)
 
+    async def report_outcome(self, session_id: str, solved: bool, turns: int) -> bool:
+        """Feed a finished episode's outcome back to the continuation controller.
+
+        Best-effort: the controller only uses it to update its per-repo success
+        rate b(x) and its expected-remaining-turns estimate, so a failure here
+        must never break a rollout.
+        """
+        try:
+            resp = await self._http.post(
+                f"{self.gateway_url}/controller/outcome",
+                json={"session_id": session_id, "solved": bool(solved), "turns": int(turns)},
+            )
+            return resp.status_code < 400
+        except Exception:
+            return False
+
     async def delete_sessions(self, session_ids: list[str]) -> int:
         """Batch-delete sessions (and their traces) in a single round-trip."""
         if not session_ids:

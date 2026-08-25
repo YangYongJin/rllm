@@ -300,6 +300,27 @@ def create_app(
         count = await sessions.delete_session(session_id)
         return {"deleted": count}
 
+    @app.post("/controller/outcome")
+    async def controller_outcome(request: Request):
+        """Feed a finished episode's outcome to the continuation controller.
+
+        Without this the controller's b(x) and remaining-turn estimates never
+        leave their priors (0.125 / 12.0), which made the "adaptive" rule
+        effectively static — see CONTROLLER_DESIGN.md.
+        """
+        body = await _safe_json(request)
+        ctrl = getattr(proxy, "_controller", None)
+        if ctrl is None:
+            return {"observed": False, "reason": "controller disabled"}
+        session_id = body.get("session_id")
+        if not session_id:
+            return {"observed": False, "reason": "missing session_id"}
+        try:
+            ctrl.observe_outcome(session_id, bool(body.get("solved")), int(body.get("turns") or 0))
+        except Exception as exc:  # never break a rollout on bookkeeping
+            return {"observed": False, "reason": repr(exc)[:200]}
+        return {"observed": True}
+
     @app.post("/sessions/batch_delete")
     async def batch_delete_sessions(request: Request):
         body = await _safe_json(request)
