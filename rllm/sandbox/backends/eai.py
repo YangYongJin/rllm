@@ -62,10 +62,26 @@ _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"}
 # 20:26 UTC — one rotation killed a training run and four eval jobs, because
 # auth errors were classified non-transient and failed on the first try).
 # A genuinely expired session still fails, just after the ladder runs out.
+# Lowercase: every comparison lowercases the CLI output first, so the checks
+# cannot silently stop matching if the CLI changes capitalization.
 _TRANSIENT_ERRS = (
     "502", "503", "504", "http: 500", "server-side error", "internal error",
     "no response", "token is invalid", "context deadline exceeded",
 )
+
+
+def _is_transient(err: str) -> bool:
+    """True if `err` is a CLI/control-plane failure worth retrying.
+
+    Requires a CLI error marker: the transient list contains bare status codes
+    ("502"), and a *remote command*'s output can easily contain those digits
+    (line numbers, test ids, hashes). Matching them without a marker would
+    re-run side-effecting agent/verifier commands that had actually executed.
+    """
+    low = (err or "").lower()
+    if "error:" not in low and "http:" not in low:
+        return False
+    return any(t in low for t in _TRANSIENT_ERRS)
 
 # A sandbox's max-run-time IS the lifetime of a leaked sandbox (nothing else
 # reclaims one whose owner died). Observed episodes finish in <15 min, so 2 h
@@ -95,6 +111,34 @@ def _record_leak(job_id: str, name: str, err: str) -> None:
             fh.write(json.dumps(rec) + "\n")
     except Exception:
         logger.exception("failed to record leaked sandbox %s", job_id)
+
+
+def _kill_job(job_id: str, attempts: int = 4) -> tuple[bool, str]:
+    """Best-effort kill with a short retry ladder. Returns (killed, last_error).
+
+    Ladder is deliberately short (~35 s): this runs on teardown, so a long
+    ladder would stall rollout throughput during a control-plane outage.
+    Whatever it cannot kill is handed to the leak log for the reaper.
+    """
+    last_err = ""
+    for attempt in range(attempts):
+        try:
+            proc = _eai("job", "kill", job_id, timeout=60)
+        except Exception as exc:  # TimeoutExpired / OSError
+            last_err = repr(exc)
+        else:
+            if proc.returncode == 0:
+                return True, ""
+            last_err = (proc.stderr or "").strip()
+            low = last_err.lower()
+            # Already terminal or already gone: nothing left to kill.
+            if "cannot cancel a job that is in state" in low or "not found" in low:
+                return True, "already terminal"
+            if not _is_transient(last_err):
+                break
+        if attempt < attempts - 1:
+            time.sleep(5 * 2**attempt)
+    return False, last_err
 
 
 def map_image(image: str) -> str:
@@ -166,9 +210,38 @@ class EAISandbox:
             raise RuntimeError(f"EAISandbox {name}: job submission failed: {proc.stderr.strip()[:500]}")
         self.job_id = proc.stdout.strip().splitlines()[-1].strip()
         if not re.fullmatch(r"[0-9a-f-]{36}", self.job_id):
+            # A job may well have been created; we just cannot address it.
+            # Record by NAME so the reaper's age sweep can still find it.
+            _record_leak("", job_name, f"unparseable job id: {proc.stdout[:200]!r}")
             raise RuntimeError(f"EAISandbox {name}: unexpected job id output: {proc.stdout[:200]!r}")
 
-        self._wait_running(ready_timeout)
+        # ANY failure from here on must kill the job we just submitted. If
+        # __init__ raises, the object never reaches the caller, so the hook
+        # layer's cleanup sees `sandbox is None` and close() is NEVER called —
+        # the job then runs to its max-run-time cap unreferenced. This was the
+        # dominant leak path (574 abandoned jobs on 2026-08-25, all from
+        # `_wait_running` timing out during control-plane flaps), much larger
+        # than the close() path.
+        try:
+            self._wait_running(ready_timeout)
+        except BaseException as exc:
+            killed, kill_err = _kill_job(self.job_id)
+            if killed:
+                logger.warning(
+                    "EAISandbox %s: startup failed (%s); job %s killed",
+                    name, exc, self.job_id,
+                )
+            else:
+                logger.error(
+                    "EAISandbox %s: startup failed AND job %s could not be killed: %s",
+                    name, self.job_id, kill_err[:200],
+                )
+                _record_leak(self.job_id, name, f"startup cleanup failed: {kill_err}")
+            try:
+                shutil.rmtree(self._transfer_dir, ignore_errors=True)
+            except Exception:
+                pass
+            raise
         logger.info("EAISandbox %s created (job: %s, image: %s)", name, self.job_id, self.image)
 
     def _state(self) -> str:
@@ -212,7 +285,11 @@ class EAISandbox:
             # never started; exit 7 = transport error before execution.
             # Ladder totals ~5 min for multi-minute control-plane flaps.
             err = proc.stderr or ""
-            transient = any(t in err for t in _TRANSIENT_ERRS)
+            # _is_transient requires a CLI error marker, so a remote command
+            # that merely PRINTS "502" (line numbers, hashes, test ids) and
+            # exits 1 is not re-executed — re-running a side-effecting agent
+            # or verifier command would corrupt the episode.
+            transient = _is_transient(err)
             if attempt < 5 and transient and proc.returncode in (1, 7):
                 time.sleep(min(120, 8 * 2**attempt))
                 continue
@@ -276,26 +353,7 @@ class EAISandbox:
         whatever it cannot kill is written to the leak log for the reaper
         (`scripts/eai/reap_sandboxes.py`).
         """
-        killed, last_err = False, ""
-        for attempt in range(4):
-            try:
-                proc = _eai("job", "kill", self.job_id, timeout=60)
-            except Exception as exc:  # TimeoutExpired / OSError
-                last_err = repr(exc)
-            else:
-                if proc.returncode == 0:
-                    killed = True
-                    break
-                last_err = (proc.stderr or "").strip()
-                low = last_err.lower()
-                # Already terminal or already gone: nothing left to kill.
-                if "cannot cancel a job that is in state" in low or "not found" in low:
-                    killed = True
-                    break
-                if not any(t in last_err for t in _TRANSIENT_ERRS):
-                    break  # non-transient: retrying will not help
-            if attempt < 3:
-                time.sleep(5 * 2**attempt)
+        killed, last_err = _kill_job(self.job_id)
 
         try:
             if os.path.isdir(self._transfer_dir):
