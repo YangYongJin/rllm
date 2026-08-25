@@ -27,6 +27,7 @@ mount the home resource) inherit it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -53,6 +54,35 @@ TRANSFER_DATA_SPEC = os.environ.get(
 TRANSFER_REMOTE_DIR = "/mnt/rc_transfer"
 
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"}
+
+# A sandbox's max-run-time IS the lifetime of a leaked sandbox (nothing else
+# reclaims one whose owner died). Observed episodes finish in <15 min, so 2 h
+# leaves a wide margin while cutting the cost of each leak 3x vs the old 6 h.
+# Raise via env for long-horizon experiments (higher turn caps / slower tools).
+SANDBOX_MAX_RUN_TIME = int(os.environ.get("RLLM_EAI_SANDBOX_MAX_RUN_TIME", "7200"))
+
+# Sandboxes whose kill could not be confirmed are appended here so a reaper
+# can clean them up precisely, without guessing from job age.
+LEAK_LOG = os.environ.get(
+    "RLLM_EAI_LEAK_LOG", "/mnt/adea/data_rw/rollout_control/leaked_sandboxes.jsonl"
+)
+
+
+def _record_leak(job_id: str, name: str, err: str) -> None:
+    """Append a leaked-sandbox record. Best-effort: never raises into teardown."""
+    try:
+        os.makedirs(os.path.dirname(LEAK_LOG), exist_ok=True)
+        rec = {
+            "job_id": job_id,
+            "name": name,
+            "parent": os.environ.get("EAI_JOB_ID", ""),
+            "ts": time.time(),
+            "error": err[:300],
+        }
+        with open(LEAK_LOG, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        logger.exception("failed to record leaked sandbox %s", job_id)
 
 
 def map_image(image: str) -> str:
@@ -88,7 +118,7 @@ class EAISandbox:
         image: str = "python:3.11-slim",
         cpu: int = 4,
         mem: int = 16,
-        max_run_time: int = 21600,
+        max_run_time: int = SANDBOX_MAX_RUN_TIME,
         ready_timeout: float = 600.0,
         **kwargs,
     ):
@@ -224,16 +254,51 @@ class EAISandbox:
             return False
 
     def close(self) -> None:
-        try:
-            _eai("job", "kill", self.job_id, timeout=60)
-        except Exception:
-            pass
+        """Kill the sandbox job, then drop its transfer dir.
+
+        Teardown must be as resilient as creation: `_eai` does NOT raise on a
+        non-zero exit, so the old ``try/except: pass`` swallowed 5xx kills and
+        still logged success — every control-plane flap silently leaked a
+        4-CPU/16-GB job until its ``max_run_time`` cap. The ladder is kept
+        SHORT (~35 s) so teardown latency stays bounded during an outage;
+        whatever it cannot kill is written to the leak log for the reaper
+        (`scripts/eai/reap_sandboxes.py`).
+        """
+        killed, last_err = False, ""
+        for attempt in range(4):
+            try:
+                proc = _eai("job", "kill", self.job_id, timeout=60)
+            except Exception as exc:  # TimeoutExpired / OSError
+                last_err = repr(exc)
+            else:
+                if proc.returncode == 0:
+                    killed = True
+                    break
+                last_err = (proc.stderr or "").strip()
+                low = last_err.lower()
+                # Already terminal or already gone: nothing left to kill.
+                if "cannot cancel a job that is in state" in low or "not found" in low:
+                    killed = True
+                    break
+                if not any(t in last_err for t in ("502", "503", "504", "http: 500", "internal error", "no response")):
+                    break  # non-transient: retrying will not help
+            if attempt < 3:
+                time.sleep(5 * 2**attempt)
+
         try:
             if os.path.isdir(self._transfer_dir):
                 shutil.rmtree(self._transfer_dir, ignore_errors=True)
         except Exception:
             pass
-        logger.info("EAISandbox %s closed (job: %s)", self.name, self.job_id)
+
+        if killed:
+            logger.info("EAISandbox %s closed (job: %s)", self.name, self.job_id)
+        else:
+            logger.error(
+                "EAISandbox %s LEAKED job %s — kill failed after retries: %s",
+                self.name, self.job_id, last_err[:300],
+            )
+            _record_leak(self.job_id, self.name, last_err)
 
 
 def _shquote(s: str) -> str:
