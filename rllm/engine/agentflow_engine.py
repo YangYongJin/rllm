@@ -436,7 +436,10 @@ class AgentFlowEngine:
         for idx, (task, task_id) in enumerate(zip(tasks, task_ids, strict=True)):
             rollout_idx = task_id_counter[task_id]
             task_id_counter[task_id] += 1
-            uid = f"{task_id}:{rollout_idx}"
+            # ":val" suffix marks validation sessions so the gateway-side
+            # continuation controller exempts them (Episode.task_id/rollout_idx
+            # read split(":")[0]/[1], so a suffix is transparent to both).
+            uid = f"{task_id}:{rollout_idx}:val" if is_validation else f"{task_id}:{rollout_idx}"
             uids.append(uid)
             futures.append(self.process_task_with_retry(task, task_id, rollout_idx, idx, is_validation=is_validation))
 
@@ -490,7 +493,7 @@ class AgentFlowEngine:
 
         async with self._semaphore:
             for retry_attempt in range(1, self.retry_limit + 1):
-                uid = f"{task_id}:{rollout_idx}"
+                uid = f"{task_id}:{rollout_idx}:val" if is_validation else f"{task_id}:{rollout_idx}"
                 if retry_attempt > 1:
                     try:
                         await self.gateway.adelete_session(uid)

@@ -137,6 +137,11 @@ class ContinuationController:
     def on_turn(self, session_id: str, request_body: dict[str, Any]) -> dict[str, Any] | None:
         """Called per session turn. Returns a synthetic terminal response body
         to STOP the rollout, or None to let the request through."""
+        # Validation sessions (":val"-suffixed by AgentFlowEngine) are NEVER
+        # stopped: the controller is a training-cost intervention; val must
+        # measure the policy exactly like an uncontrolled baseline.
+        if session_id.endswith(":val"):
+            return None
         st = self._session(session_id)
         st["turn"] += 1
         turn = st["turn"]
