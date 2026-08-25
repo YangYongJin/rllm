@@ -52,6 +52,8 @@ def controller_from_env() -> "ContinuationController | None":
         lam=float(os.environ.get("RLLM_CONTROLLER_LAMBDA", "0.3")),
         beta=float(os.environ.get("RLLM_CONTROLLER_BETA", "0.0")),
         online_stats=os.environ.get("RLLM_CONTROLLER_ONLINE_STATS", "0") in ("1", "true", "True"),
+        group_floor=int(os.environ.get("RLLM_CONTROLLER_GROUP_FLOOR", "0")),
+        task_rates_path=os.environ.get("RLLM_CONTROLLER_TASK_RATES") or None,
         temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
         p_min=float(os.environ.get("RLLM_CONTROLLER_P_MIN", "0.05")),
         p_stop=float(os.environ.get("RLLM_CONTROLLER_P_STOP", "0.15")),
@@ -70,6 +72,8 @@ class ContinuationController:
         lam: float = 0.3,
         beta: float = 0.0,
         online_stats: bool = False,
+        group_floor: int = 0,
+        task_rates_path: str | None = None,
         temperature: float = 0.15,
         p_min: float = 0.05,
         p_stop: float = 0.15,
@@ -84,6 +88,26 @@ class ContinuationController:
         # OFF by default: observe_outcome() had no caller until 2026-08-25, so
         # every run to date used the frozen priors. Keep that reproducible.
         self.online_stats = online_stats
+        # v3-M2: never let a task's group of rollouts fall below this many
+        # survivors. A GRPO group needs >=2 non-identical members to yield any
+        # advantage; stopping siblings can otherwise discard the one rare
+        # success on a hard task (see V3_DESIGN.md D1). 0 disables the floor.
+        self.group_floor = group_floor
+        self._group_alive: dict[str, int] = {}
+        # v3-M3: per-task solve rates beat per-repo ones (within-repo variance
+        # is what decides a group's fate). Falls back repo -> global prior.
+        self._task_rates: dict[str, float] = {}
+        if task_rates_path:
+            try:
+                with open(task_rates_path) as fh:
+                    raw = json.load(fh)
+                for k, v in raw.items():
+                    n = float(v.get("attempts", 0) or 0)
+                    if n > 0:
+                        self._task_rates[k] = float(v.get("solves", 0) or 0) / n
+                logger.info("loaded %d task solve rates from %s", len(self._task_rates), task_rates_path)
+            except Exception:
+                logger.exception("could not load task rates from %s", task_rates_path)
         self._head = None
         if mode == "learned":
             with open(head_path) as f:
@@ -107,6 +131,19 @@ class ContinuationController:
         )
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _group_key(session_id: str) -> str:
+        """Group = the task; sessions are '<task_id>:<rollout_idx>[:val]'."""
+        return session_id.rsplit(":", 1)[0] if session_id.count(":") >= 1 else session_id
+
+    def _base_rate(self, session_id: str, repo: str) -> float:
+        """b(x): task rate if known, else per-repo online rate, else prior."""
+        task = self._group_key(session_id).split("/")[-1]
+        if task in self._task_rates:
+            return self._task_rates[task]
+        solved, total = self._b_x.get(repo, [0.0, 0.0])
+        return (solved + 1.0) / (total + 8.0)
+
     def _is_audit(self, session_id: str) -> bool:
         """Deterministic audit membership, derived from the session id.
 
@@ -125,8 +162,11 @@ class ContinuationController:
         with self._lock:
             st = self._sessions.get(session_id)
             if st is None:
-                st = {"audit": self._is_audit(session_id), "turn": 0, "stopped": False}
+                st = {"audit": self._is_audit(session_id), "turn": 0, "stopped": False,
+                      "session_id": session_id}
                 self._sessions[session_id] = st
+                gk = self._group_key(session_id)
+                self._group_alive[gk] = self._group_alive.get(gk, 0) + 1
             return st
 
     def _continue_prob(self, st: dict[str, Any]) -> float:
@@ -142,8 +182,7 @@ class ContinuationController:
         z = sum(wi * xi for wi, xi in zip(h["weights"], x)) + h["bias"]
         p_hat = 1.0 / (1.0 + math.exp(-z))
         repo = st.get("repo", "unknown")
-        solved, total = self._b_x.get(repo, [0.0, 0.0])
-        b = (solved + 1.0) / (total + 8.0)  # smoothed per-repo success rate
+        b = self._base_rate(st.get("session_id", ""), repo)
         v_c = p_hat * (1.0 - b) + (1.0 - p_hat) * b
         mean_turns = (sum(self._turn_costs) / len(self._turn_costs)) if self._turn_costs else 12.0
         remaining = max(0.0, mean_turns - st["turn"]) / max(mean_turns, 1.0)
@@ -174,8 +213,23 @@ class ContinuationController:
         sampled_continue = True
         if eligible:
             sampled_continue = self._rng.random() < s_t
+        # v3-M2 group floor: a GRPO group needs >=2 members with differing
+        # rewards to produce any advantage, so stopping the last survivors
+        # destroys the very signal the rollouts were paid for (worst case: the
+        # one rare success on a hard task). Hold, and log it distinctly so the
+        # propensity accounting stays exact.
+        gk = self._group_key(session_id)
+        floor_hold = False
+        if self.group_floor > 0 and eligible and not sampled_continue:
+            with self._lock:
+                if self._group_alive.get(gk, 0) <= self.group_floor:
+                    floor_hold = True
         # Audits always complete; the counterfactual decision is still logged.
-        action = "continue" if (sampled_continue or st["audit"] or not eligible) else "stop"
+        stopping = eligible and not sampled_continue and not st["audit"] and not floor_hold
+        action = "stop" if stopping else ("floor_hold" if floor_hold else "continue")
+        if stopping:
+            with self._lock:
+                self._group_alive[gk] = max(0, self._group_alive.get(gk, 0) - 1)
 
         self._log(
             {
@@ -186,6 +240,8 @@ class ContinuationController:
                 "sampled_continue": sampled_continue,
                 "audit": st["audit"],
                 "action": action,
+                "group_alive": self._group_alive.get(gk, 0),
+                "floor_hold": floor_hold,
                 "controller_version": CONTROLLER_VERSION,
                 "ts": time.time(),
             }
