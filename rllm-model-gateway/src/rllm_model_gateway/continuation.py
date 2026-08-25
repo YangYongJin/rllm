@@ -26,6 +26,7 @@ Config via environment (v0; the launcher maps hydra keys onto these):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -93,6 +94,7 @@ class ContinuationController:
         self.audit_fraction = audit_fraction
         self.min_turns = min_turns
         self._rng = random.Random(seed)
+        self._audit_salt = str(seed if seed is not None else 0)
         self._lock = threading.Lock()
         self._sessions: dict[str, dict[str, Any]] = {}
         self._log_path = None
@@ -105,11 +107,25 @@ class ContinuationController:
         )
 
     # ------------------------------------------------------------------
+    def _is_audit(self, session_id: str) -> bool:
+        """Deterministic audit membership, derived from the session id.
+
+        Previously this was sampled once and kept in mutable per-session state.
+        Any state loss (gateway restart — method_9b_v1 had 12) re-sampled it, so
+        a session admitted as an audit could be re-admitted as non-audit and then
+        STOPPED: 59 sessions changed audit flag mid-stream, contaminating the very
+        stream the false-stop rate is estimated from. Hashing is stable across
+        restarts and processes, keeps the expected fraction, and makes audit
+        membership reproducible from the session id alone.
+        """
+        h = hashlib.blake2b(f"{self._audit_salt}:{session_id}".encode(), digest_size=8).digest()
+        return (int.from_bytes(h, "big") % 1_000_000) < int(self.audit_fraction * 1_000_000)
+
     def _session(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             st = self._sessions.get(session_id)
             if st is None:
-                st = {"audit": self._rng.random() < self.audit_fraction, "turn": 0, "stopped": False}
+                st = {"audit": self._is_audit(session_id), "turn": 0, "stopped": False}
                 self._sessions[session_id] = st
             return st
 
