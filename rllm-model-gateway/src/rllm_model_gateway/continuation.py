@@ -37,11 +37,27 @@ import time
 import uuid
 from typing import Any
 
-from rllm_model_gateway.group_utility import marginal_dU
+from rllm_model_gateway.group_utility import expected_U, marginal_dU
 
 logger = logging.getLogger(__name__)
 
-CONTROLLER_VERSION = "v0-random-1"
+CONTROLLER_VERSION = "v0-random-1"  # legacy default; see _version_string()
+
+
+def _version_string(mode: str, rule: str, head: dict | None) -> str:
+    """Identify the controller that produced a decision record.
+
+    The old constant was stamped on every record regardless of mode, so logs
+    from a learned run were indistinguishable from a random one and could not
+    be traced to a head.
+    """
+    if head is None:
+        return f"{mode}-{rule}-nohead"
+    payload = json.dumps(
+        {"w": head.get("weights"), "b": head.get("bias"), "f": head.get("feature_names")},
+        sort_keys=True,
+    ).encode()
+    return f"{mode}-{rule}-{hashlib.blake2b(payload, digest_size=4).hexdigest()}"
 STOP_SENTINEL_CMD = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
 
@@ -57,6 +73,7 @@ def controller_from_env() -> "ContinuationController | None":
         group_floor=int(os.environ.get("RLLM_CONTROLLER_GROUP_FLOOR", "0")),
         rule=os.environ.get("RLLM_CONTROLLER_RULE", "sigmoid_diff"),
         tau=float(os.environ.get("RLLM_CONTROLLER_TAU", "0.02")),
+        max_contrast_loss=float(os.environ.get("RLLM_CONTROLLER_MAX_CONTRAST_LOSS", "0.0")),
         gamma_dup=float(os.environ.get("RLLM_CONTROLLER_GAMMA_DUP", "0.0")),
         task_rates_path=os.environ.get("RLLM_CONTROLLER_TASK_RATES") or None,
         temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
@@ -81,6 +98,7 @@ class ContinuationController:
         task_rates_path: str | None = None,
         rule: str = "sigmoid_diff",
         tau: float = 0.02,
+        max_contrast_loss: float = 0.0,
         cost_head: dict | None = None,
         gamma_dup: float = 0.0,
         temperature: float = 0.15,
@@ -107,6 +125,10 @@ class ContinuationController:
         # token against a shadow price tau. 'sigmoid_diff' keeps v1/v2.
         self.rule = rule
         self.tau = tau
+        # Relative-contrast guard: refuse any stop that would destroy more than
+        # this fraction of the group's remaining expected gradient. Adapts to
+        # the group's actual state, unlike the fixed count floor. 0 disables.
+        self.max_contrast_loss = max_contrast_loss
         self.cost_head = cost_head
         self.gamma_dup = gamma_dup
         # group_key -> {session_id: p_hat (or settled 0.0/1.0)}
@@ -142,9 +164,12 @@ class ContinuationController:
         if decision_log_dir:
             os.makedirs(decision_log_dir, exist_ok=True)
             self._log_path = os.path.join(decision_log_dir, f"controller_decisions_{os.getpid()}.jsonl")
+        self.version = _version_string(mode, rule, self._head)
         logger.info(
-            "ContinuationController active: mode=%s p_stop=%.3f audit=%.2f min_turns=%d log=%s",
-            mode, p_stop, audit_fraction, min_turns, self._log_path,
+            "ContinuationController active: version=%s mode=%s rule=%s tau=%.4f p_stop=%.3f "
+            "audit=%.2f min_turns=%d floor=%d max_contrast_loss=%.2f online_stats=%s log=%s",
+            self.version, mode, rule, tau, p_stop, audit_fraction, min_turns,
+            group_floor, max_contrast_loss, online_stats, self._log_path,
         )
 
     # ------------------------------------------------------------------
@@ -226,6 +251,9 @@ class ContinuationController:
         except ValueError:  # pragma: no cover - defensive
             return 1.0 - self.p_stop
         d_u = marginal_dU(idx, ps)
+        if self.max_contrast_loss > 0.0:
+            u_now = expected_U(ps)
+            st["_contrast_frac"] = (d_u / u_now) if u_now > 0 else 0.0
         if self.gamma_dup > 0.0:
             d_u *= max(0.0, 1.0 - self.gamma_dup * float(st.get("dup_sim", 0.0)))
         score = d_u / max(self._remaining_cost(st), 1e-6)
@@ -285,10 +313,14 @@ class ContinuationController:
         # propensity accounting stays exact.
         gk = self._group_key(session_id)
         floor_hold = False
-        if self.group_floor > 0 and eligible and not sampled_continue:
-            with self._lock:
-                if self._group_alive.get(gk, 0) <= self.group_floor:
-                    floor_hold = True
+        if eligible and not sampled_continue:
+            if self.group_floor > 0:
+                with self._lock:
+                    if self._group_alive.get(gk, 0) <= self.group_floor:
+                        floor_hold = True
+            if (not floor_hold and self.max_contrast_loss > 0.0
+                    and st.get("_contrast_frac", 0.0) > self.max_contrast_loss):
+                floor_hold = True   # would destroy too much of the group's gradient
         # Audits always complete; the counterfactual decision is still logged.
         stopping = eligible and not sampled_continue and not st["audit"] and not floor_hold
         action = "stop" if stopping else ("floor_hold" if floor_hold else "continue")
@@ -310,7 +342,7 @@ class ContinuationController:
                 "action": action,
                 "group_alive": self._group_alive.get(gk, 0),
                 "floor_hold": floor_hold,
-                "controller_version": CONTROLLER_VERSION,
+                "controller_version": self.version,
                 "ts": time.time(),
             }
         )
