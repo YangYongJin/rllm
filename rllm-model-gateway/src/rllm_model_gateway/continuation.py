@@ -39,6 +39,7 @@ from typing import Any
 
 from rllm_model_gateway.group_utility import expected_U, marginal_dU
 from rllm_model_gateway.signatures import RolloutSignature, max_similarity
+from rllm_model_gateway.retrieval import RetrievalMemory, hash_tfidf
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,8 @@ def controller_from_env() -> "ContinuationController | None":
         tau=float(os.environ.get("RLLM_CONTROLLER_TAU", "0.02")),
         max_contrast_loss=float(os.environ.get("RLLM_CONTROLLER_MAX_CONTRAST_LOSS", "0.0")),
         hot_reload=os.environ.get("RLLM_CONTROLLER_HOT_RELOAD", "0") in ("1", "true", "True"),
+        transfer=os.environ.get("RLLM_CONTROLLER_TRANSFER", "0") in ("1", "true", "True"),
+        memory_path=os.environ.get("RLLM_CONTROLLER_MEMORY") or None,
         gamma_dup=float(os.environ.get("RLLM_CONTROLLER_GAMMA_DUP", "0.0")),
         task_rates_path=os.environ.get("RLLM_CONTROLLER_TASK_RATES") or None,
         temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
@@ -115,6 +118,8 @@ class ContinuationController:
         tau: float = 0.02,
         max_contrast_loss: float = 0.0,
         hot_reload: bool = False,
+        transfer: bool = False,
+        memory_path: str | None = None,
         cost_head: dict | None = None,
         gamma_dup: float = 0.0,
         temperature: float = 0.15,
@@ -150,6 +155,14 @@ class ContinuationController:
         self.gamma_dup = gamma_dup
         # group_key -> {session_id: RolloutSignature} for the duplicate discount
         self._group_sig: dict[str, dict[str, RolloutSignature]] = {}
+        # M8 transfer: controller-only experience memory. Loaded from disk when
+        # a path is given, which is what carries the controller across runs and
+        # onto held-out repositories.
+        self.transfer = transfer
+        self._memory = RetrievalMemory.load(memory_path) if (transfer and memory_path) else (
+            RetrievalMemory() if transfer else None)
+        self._memory_path = memory_path
+        self.policy_version = 0
         # group_key -> {session_id: p_hat (or settled 0.0/1.0)}
         self._group_p: dict[str, dict[str, float]] = {}
         # v3-M3: per-task solve rates beat per-repo ones (within-repo variance
@@ -237,6 +250,23 @@ class ContinuationController:
                 self._group_alive[gk] = self._group_alive.get(gk, 0) + 1
             return st
 
+    def _task_vector(self, session_id: str, request_body: dict[str, Any], st: dict[str, Any]) -> list[float]:
+        """z_x: hashed TF-IDF over the problem statement + files touched so far.
+
+        The problem statement is the first user message and never changes, so
+        the text part is computed once per session; touched files are appended
+        as the rollout discovers them.
+        """
+        z = st.get("_z_text")
+        if z is None:
+            msgs = request_body.get("messages") or []
+            problem = next((str(m.get("content") or "") for m in msgs if m.get("role") == "user"), "")
+            st["_z_text"] = z = problem[:4000]
+        gk = self._group_key(session_id)
+        sig = (self._group_sig.get(gk) or {}).get(session_id)
+        files = sorted(sig.files)[:12] if sig else []
+        return hash_tfidf(z, extra_tokens=files)
+
     def _update_signature(self, session_id: str, request_body: dict[str, Any], st: dict[str, Any]) -> None:
         """Track this rollout's action fingerprint and its similarity to siblings.
 
@@ -299,6 +329,8 @@ class ContinuationController:
         h = self._head
         feats = st.get("features") or {}
         x = [(float(feats.get(k, 0.0)) - m) / s_ for k, m, s_ in zip(h["feature_names"], h["mu"], h["sd"])]
+        if self.transfer:
+            st["_e_vec"] = x            # e(h_t): the projection retrieval keys on
         z = sum(wi * xi for wi, xi in zip(h["weights"], x)) + h["bias"]
         return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
 
@@ -337,6 +369,13 @@ class ContinuationController:
         if self.max_contrast_loss > 0.0:
             u_now = expected_U(ps)
             st["_contrast_frac"] = (d_u / u_now) if u_now > 0 else 0.0
+        if self.transfer and self._memory is not None and len(self._memory):
+            z = st.get("_z_vec") or []
+            e_h = st.get("_e_vec") or []
+            v_ret, rho = self._memory.query(z, e_h, policy_version=self.policy_version)
+            if rho > 0.0:
+                d_u = (1.0 - rho) * d_u + rho * v_ret
+                st["rho"] = rho
         if self.gamma_dup > 0.0:
             d_u *= max(0.0, 1.0 - self.gamma_dup * float(st.get("dup_sim", 0.0)))
         score = d_u / max(self._remaining_cost(st), 1e-6)
@@ -381,6 +420,8 @@ class ContinuationController:
 
         if self.gamma_dup > 0.0:
             self._update_signature(session_id, request_body, st)
+        if self.transfer:
+            st["_z_vec"] = self._task_vector(session_id, request_body, st)
         if self.rule == "ratio" and self.mode == "learned" and self._head is not None:
             s_t = self._continue_prob_ratio(st, session_id)
             gk_reg = self._group_key(session_id)
@@ -493,9 +534,50 @@ class ContinuationController:
             gk = self._group_key(session_id)
             if gk in self._group_p and session_id in self._group_p[gk]:
                 self._group_p[gk][session_id] = 1.0 if solved else 0.0
+        if self.transfer and self._memory is not None:
+            self._record_experience(session_id, solved)
             self._turn_costs.append(turns)
             if len(self._turn_costs) > 500:
                 self._turn_costs = self._turn_costs[-500:]
+
+    def _record_experience(self, session_id: str, solved: bool) -> None:
+        """Store realized utility for retrieval, in the SAME units as dU.
+
+        The realized quantity matching dU (expected advantage mass) is this
+        rollout's actual advantage magnitude |r_i - mean(r_group)| over its
+        settled siblings. Storing anything else would blend incomparable scales
+        into V_tr.
+        """
+        st = self._sessions.get(session_id)
+        if not st:
+            return
+        gk = self._group_key(session_id)
+        with self._lock:
+            settled = [v for k, v in (self._group_p.get(gk) or {}).items() if v in (0.0, 1.0)]
+        r_i = 1.0 if solved else 0.0
+        if settled:
+            u = abs(r_i - (sum(settled) / len(settled)))
+        else:
+            u = 0.0
+        z = st.get("_z_vec")
+        e_h = st.get("_e_vec")
+        if not z or not e_h:
+            return
+        try:
+            self._memory.add(z, e_h, u, policy_version=self.policy_version,
+                             stratum=st.get("repo", "unknown"))
+        except Exception:
+            logger.debug("retrieval memory add failed", exc_info=True)
+
+    def save_memory(self) -> None:
+        """Persist controller experience so a later run can transfer from it."""
+        if self._memory is not None and self._memory_path:
+            try:
+                self._memory.save(self._memory_path)
+                logger.info("controller memory saved (%d entries) -> %s",
+                            len(self._memory), self._memory_path)
+            except Exception:
+                logger.exception("could not save controller memory")
 
     def _terminal_response(self, request_body: dict[str, Any]) -> dict[str, Any]:
         """OpenAI-format response carrying the harness's own exit action."""
