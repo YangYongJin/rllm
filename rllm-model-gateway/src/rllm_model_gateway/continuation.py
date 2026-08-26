@@ -61,10 +61,22 @@ def _version_string(mode: str, rule: str, head: dict | None) -> str:
 STOP_SENTINEL_CMD = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
 
+def _load_json_or_none(path: str | None, what: str) -> dict | None:
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        logger.exception("could not load %s from %s; falling back", what, path)
+        return None
+
+
 def controller_from_env() -> "ContinuationController | None":
     if os.environ.get("RLLM_CONTROLLER_ENABLE", "0") not in ("1", "true", "True"):
         return None
     return ContinuationController(
+        cost_head=_load_json_or_none(os.environ.get("RLLM_CONTROLLER_COST_HEAD"), "cost head"),
         mode=os.environ.get("RLLM_CONTROLLER_MODE", "random"),
         head_path=os.environ.get("RLLM_CONTROLLER_HEAD") or None,
         lam=float(os.environ.get("RLLM_CONTROLLER_LAMBDA", "0.3")),
