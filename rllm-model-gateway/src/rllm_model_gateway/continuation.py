@@ -38,6 +38,7 @@ import uuid
 from typing import Any
 
 from rllm_model_gateway.group_utility import expected_U, marginal_dU
+from rllm_model_gateway.signatures import RolloutSignature, max_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,8 @@ class ContinuationController:
         self.hot_reload = hot_reload
         self.cost_head = cost_head
         self.gamma_dup = gamma_dup
+        # group_key -> {session_id: RolloutSignature} for the duplicate discount
+        self._group_sig: dict[str, dict[str, RolloutSignature]] = {}
         # group_key -> {session_id: p_hat (or settled 0.0/1.0)}
         self._group_p: dict[str, dict[str, float]] = {}
         # v3-M3: per-task solve rates beat per-repo ones (within-repo variance
@@ -233,6 +236,29 @@ class ContinuationController:
                 gk = self._group_key(session_id)
                 self._group_alive[gk] = self._group_alive.get(gk, 0) + 1
             return st
+
+    def _update_signature(self, session_id: str, request_body: dict[str, Any], st: dict[str, Any]) -> None:
+        """Track this rollout's action fingerprint and its similarity to siblings.
+
+        The gateway only sees the conversation, so the "action" is the last
+        assistant message -- which for mini-swe-agent is the bash command it is
+        about to run.
+        """
+        msgs = request_body.get("messages") or []
+        last_assistant = ""
+        for m in reversed(msgs):
+            if m.get("role") == "assistant":
+                last_assistant = str(m.get("content") or "")
+                break
+        gk = self._group_key(session_id)
+        with self._lock:
+            sigs = self._group_sig.setdefault(gk, {})
+            sig = sigs.get(session_id)
+            if sig is None:
+                sig = sigs[session_id] = RolloutSignature()
+            if last_assistant:
+                sig.update(last_assistant)
+            st["dup_sim"] = max_similarity(sig, [v for k, v in sigs.items() if k != session_id])
 
     def _maybe_reload_head(self) -> None:
         """Pick up a head refit by controller/online_refresh.py (M4).
@@ -353,6 +379,8 @@ class ContinuationController:
         if self.mode == "learned":
             self._update_features(st, session_id, request_body)
 
+        if self.gamma_dup > 0.0:
+            self._update_signature(session_id, request_body, st)
         if self.rule == "ratio" and self.mode == "learned" and self._head is not None:
             s_t = self._continue_prob_ratio(st, session_id)
             gk_reg = self._group_key(session_id)
@@ -388,6 +416,7 @@ class ContinuationController:
                 # A stopped rollout leaves the group entirely: it is excluded
                 # from the actor batch, so it can no longer contribute contrast.
                 self._group_p.get(gk, {}).pop(session_id, None)
+                self._group_sig.get(gk, {}).pop(session_id, None)
 
         self._log(
             {
@@ -399,6 +428,7 @@ class ContinuationController:
                 "audit": st["audit"],
                 "action": action,
                 "group_alive": self._group_alive.get(gk, 0),
+                "dup_sim": round(float(st.get("dup_sim", 0.0)), 3),
                 "floor_hold": floor_hold,
                 "controller_version": self.version,
                 "ts": time.time(),
