@@ -37,6 +37,8 @@ import time
 import uuid
 from typing import Any
 
+from rllm_model_gateway.group_utility import marginal_dU
+
 logger = logging.getLogger(__name__)
 
 CONTROLLER_VERSION = "v0-random-1"
@@ -53,6 +55,9 @@ def controller_from_env() -> "ContinuationController | None":
         beta=float(os.environ.get("RLLM_CONTROLLER_BETA", "0.0")),
         online_stats=os.environ.get("RLLM_CONTROLLER_ONLINE_STATS", "0") in ("1", "true", "True"),
         group_floor=int(os.environ.get("RLLM_CONTROLLER_GROUP_FLOOR", "0")),
+        rule=os.environ.get("RLLM_CONTROLLER_RULE", "sigmoid_diff"),
+        tau=float(os.environ.get("RLLM_CONTROLLER_TAU", "0.02")),
+        gamma_dup=float(os.environ.get("RLLM_CONTROLLER_GAMMA_DUP", "0.0")),
         task_rates_path=os.environ.get("RLLM_CONTROLLER_TASK_RATES") or None,
         temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
         p_min=float(os.environ.get("RLLM_CONTROLLER_P_MIN", "0.05")),
@@ -74,6 +79,10 @@ class ContinuationController:
         online_stats: bool = False,
         group_floor: int = 0,
         task_rates_path: str | None = None,
+        rule: str = "sigmoid_diff",
+        tau: float = 0.02,
+        cost_head: dict | None = None,
+        gamma_dup: float = 0.0,
         temperature: float = 0.15,
         p_min: float = 0.05,
         p_stop: float = 0.15,
@@ -94,6 +103,14 @@ class ContinuationController:
         # success on a hard task (see V3_DESIGN.md D1). 0 disables the floor.
         self.group_floor = group_floor
         self._group_alive: dict[str, int] = {}
+        # v3: rule='ratio' scores marginal group gradient per remaining
+        # token against a shadow price tau. 'sigmoid_diff' keeps v1/v2.
+        self.rule = rule
+        self.tau = tau
+        self.cost_head = cost_head
+        self.gamma_dup = gamma_dup
+        # group_key -> {session_id: p_hat (or settled 0.0/1.0)}
+        self._group_p: dict[str, dict[str, float]] = {}
         # v3-M3: per-task solve rates beat per-repo ones (within-repo variance
         # is what decides a group's fate). Falls back repo -> global prior.
         self._task_rates: dict[str, float] = {}
@@ -169,6 +186,52 @@ class ContinuationController:
                 self._group_alive[gk] = self._group_alive.get(gk, 0) + 1
             return st
 
+    def _p_hat(self, st: dict[str, Any]) -> float:
+        """Head estimate that this rollout eventually solves its task."""
+        h = self._head
+        feats = st.get("features") or {}
+        x = [(float(feats.get(k, 0.0)) - m) / s_ for k, m, s_ in zip(h["feature_names"], h["mu"], h["sd"])]
+        z = sum(wi * xi for wi, xi in zip(h["weights"], x)) + h["bias"]
+        return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+
+    def _remaining_cost(self, st: dict[str, Any]) -> float:
+        """Expected remaining cost of this rollout, in turns (>=1).
+
+        v3 uses a cost head when one is loaded; otherwise the v1/v2 fallback of
+        (mean_turns - t), which is a single global constant for every rollout.
+        """
+        if self.cost_head:
+            h = self.cost_head
+            feats = st.get("features") or {}
+            x = [(float(feats.get(k, 0.0)) - m) / s_ for k, m, s_ in zip(h["feature_names"], h["mu"], h["sd"])]
+            pred = sum(wi * xi for wi, xi in zip(h["weights"], x)) + h["bias"]
+            return max(1.0, float(pred))
+        mean_turns = (sum(self._turn_costs) / len(self._turn_costs)) if self._turn_costs else 12.0
+        return max(1.0, mean_turns - st["turn"])
+
+    def _continue_prob_ratio(self, st: dict[str, Any], session_id: str) -> float:
+        """v3: marginal group gradient per remaining token, vs shadow price tau.
+
+        Values a rollout by what it adds to its GROUP's expected advantage mass
+        rather than by its own success probability -- see group_utility.py.
+        """
+        gk = self._group_key(session_id)
+        with self._lock:
+            members = dict(self._group_p.get(gk) or {})
+        members[session_id] = self._p_hat(st)
+        ids = sorted(members)
+        ps = [members[k] for k in ids]
+        try:
+            idx = ids.index(session_id)
+        except ValueError:  # pragma: no cover - defensive
+            return 1.0 - self.p_stop
+        d_u = marginal_dU(idx, ps)
+        if self.gamma_dup > 0.0:
+            d_u *= max(0.0, 1.0 - self.gamma_dup * float(st.get("dup_sim", 0.0)))
+        score = d_u / max(self._remaining_cost(st), 1e-6)
+        z = max(-30.0, min(30.0, (score - self.tau) / max(self.temperature, 1e-6)))
+        return self.p_min + (1.0 - self.p_min) * (1.0 / (1.0 + math.exp(-z)))
+
     def _continue_prob(self, st: dict[str, Any]) -> float:
         if self.mode == "random" or self._head is None:
             return 1.0 - self.p_stop
@@ -176,11 +239,7 @@ class ContinuationController:
         #   p_hat = sigmoid(head(features));  V_c = p_hat*(1-b) + (1-p_hat)*b
         #   C     = expected remaining turns / cap (EWMA over completed sessions)
         #   s_t   = p_min + (1-p_min) * sigmoid((V_c - lam*C) / T)
-        h = self._head
-        feats = st.get("features") or {}
-        x = [(float(feats.get(k, 0.0)) - m) / s_ for k, m, s_ in zip(h["feature_names"], h["mu"], h["sd"])]
-        z = sum(wi * xi for wi, xi in zip(h["weights"], x)) + h["bias"]
-        p_hat = 1.0 / (1.0 + math.exp(-z))
+        p_hat = self._p_hat(st)
         repo = st.get("repo", "unknown")
         b = self._base_rate(st.get("session_id", ""), repo)
         v_c = p_hat * (1.0 - b) + (1.0 - p_hat) * b
@@ -208,7 +267,13 @@ class ContinuationController:
         if self.mode == "learned":
             self._update_features(st, session_id, request_body)
 
-        s_t = self._continue_prob(st)
+        if self.rule == "ratio" and self.mode == "learned" and self._head is not None:
+            s_t = self._continue_prob_ratio(st, session_id)
+            gk_reg = self._group_key(session_id)
+            with self._lock:
+                self._group_p.setdefault(gk_reg, {})[session_id] = self._p_hat(st)
+        else:
+            s_t = self._continue_prob(st)
         eligible = turn > self.min_turns and not st["stopped"]
         sampled_continue = True
         if eligible:
@@ -230,6 +295,9 @@ class ContinuationController:
         if stopping:
             with self._lock:
                 self._group_alive[gk] = max(0, self._group_alive.get(gk, 0) - 1)
+                # A stopped rollout leaves the group entirely: it is excluded
+                # from the actor batch, so it can no longer contribute contrast.
+                self._group_p.get(gk, {}).pop(session_id, None)
 
         self._log(
             {
@@ -300,6 +368,11 @@ class ContinuationController:
             rec = self._b_x.setdefault(repo, [0.0, 0.0])
             rec[0] += 1.0 if solved else 0.0
             rec[1] += 1.0
+            # Settle this member for the group's utility calculation, so live
+            # siblings score against a known outcome rather than an estimate.
+            gk = self._group_key(session_id)
+            if gk in self._group_p and session_id in self._group_p[gk]:
+                self._group_p[gk][session_id] = 1.0 if solved else 0.0
             self._turn_costs.append(turns)
             if len(self._turn_costs) > 500:
                 self._turn_costs = self._turn_costs[-500:]
