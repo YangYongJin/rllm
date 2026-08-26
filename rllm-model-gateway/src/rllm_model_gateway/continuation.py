@@ -42,6 +42,7 @@ from rllm_model_gateway.group_utility import expected_U, marginal_dU
 logger = logging.getLogger(__name__)
 
 CONTROLLER_VERSION = "v0-random-1"  # legacy default; see _version_string()
+RELOAD_STAT_EVERY = 50
 
 
 def _version_string(mode: str, rule: str, head: dict | None) -> str:
@@ -86,6 +87,7 @@ def controller_from_env() -> "ContinuationController | None":
         rule=os.environ.get("RLLM_CONTROLLER_RULE", "sigmoid_diff"),
         tau=float(os.environ.get("RLLM_CONTROLLER_TAU", "0.02")),
         max_contrast_loss=float(os.environ.get("RLLM_CONTROLLER_MAX_CONTRAST_LOSS", "0.0")),
+        hot_reload=os.environ.get("RLLM_CONTROLLER_HOT_RELOAD", "0") in ("1", "true", "True"),
         gamma_dup=float(os.environ.get("RLLM_CONTROLLER_GAMMA_DUP", "0.0")),
         task_rates_path=os.environ.get("RLLM_CONTROLLER_TASK_RATES") or None,
         temperature=float(os.environ.get("RLLM_CONTROLLER_TEMPERATURE", "0.15")),
@@ -111,6 +113,7 @@ class ContinuationController:
         rule: str = "sigmoid_diff",
         tau: float = 0.02,
         max_contrast_loss: float = 0.0,
+        hot_reload: bool = False,
         cost_head: dict | None = None,
         gamma_dup: float = 0.0,
         temperature: float = 0.15,
@@ -141,6 +144,7 @@ class ContinuationController:
         # this fraction of the group's remaining expected gradient. Adapts to
         # the group's actual state, unlike the fixed count floor. 0 disables.
         self.max_contrast_loss = max_contrast_loss
+        self.hot_reload = hot_reload
         self.cost_head = cost_head
         self.gamma_dup = gamma_dup
         # group_key -> {session_id: p_hat (or settled 0.0/1.0)}
@@ -160,9 +164,16 @@ class ContinuationController:
             except Exception:
                 logger.exception("could not load task rates from %s", task_rates_path)
         self._head = None
+        self._head_path = head_path
+        self._head_mtime = 0.0
+        self._decisions_since_stat = 0
         if mode == "learned":
             with open(head_path) as f:
                 self._head = json.load(f)
+            try:
+                self._head_mtime = os.path.getmtime(head_path)
+            except OSError:
+                pass
             self._b_x: dict[str, list[float]] = {}  # repo -> [solves, total] success EMA basis
             self._turn_costs: list[int] = []  # completed-session turn counts (C estimate)
         self.p_stop = p_stop
@@ -222,6 +233,40 @@ class ContinuationController:
                 gk = self._group_key(session_id)
                 self._group_alive[gk] = self._group_alive.get(gk, 0) + 1
             return st
+
+    def _maybe_reload_head(self) -> None:
+        """Pick up a head refit by controller/online_refresh.py (M4).
+
+        The refresher writes atomically (tmp + os.replace), so a changed mtime
+        means a complete file. Statting every decision would be wasteful, so we
+        check every RELOAD_STAT_EVERY decisions -- at ~30 rollouts/step that is
+        several times per optimizer step, far finer than the refresh interval.
+        """
+        if not self.hot_reload or self.mode != "learned" or not self._head_path:
+            return
+        self._decisions_since_stat += 1
+        if self._decisions_since_stat < RELOAD_STAT_EVERY:
+            return
+        self._decisions_since_stat = 0
+        try:
+            mt = os.path.getmtime(self._head_path)
+        except OSError:
+            return
+        if mt <= self._head_mtime:
+            return
+        try:
+            with open(self._head_path) as fh:
+                new_head = json.load(fh)
+            if not new_head.get("feature_names"):
+                raise ValueError("head has no feature_names")
+        except Exception:
+            logger.exception("head reload failed; keeping the current head")
+            return
+        with self._lock:
+            self._head = new_head
+            self._head_mtime = mt
+            self.version = _version_string(self.mode, self.rule, new_head)
+        logger.info("controller head reloaded -> version=%s", self.version)
 
     def _p_hat(self, st: dict[str, Any]) -> float:
         """Head estimate that this rollout eventually solves its task."""
@@ -301,6 +346,7 @@ class ContinuationController:
         # measure the policy exactly like an uncontrolled baseline.
         if session_id.endswith(":val"):
             return None
+        self._maybe_reload_head()
         st = self._session(session_id)
         st["turn"] += 1
         turn = st["turn"]
