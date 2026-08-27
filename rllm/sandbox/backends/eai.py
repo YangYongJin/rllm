@@ -139,6 +139,11 @@ def _is_retryable_control_plane(err: str) -> bool:
 # made more or less patient without a code change.
 SUBMIT_ATTEMPTS = max(1, int(os.environ.get("RLLM_EAI_SUBMIT_ATTEMPTS", "10")))
 
+# How much time `_wait_running` may spend BLIND (control plane unreachable)
+# without it counting against the startup deadline. Bounded so a permanently
+# unreachable API still fails the rollout rather than hanging it forever.
+WAIT_BLIND_EXTENSION = float(os.environ.get("RLLM_EAI_WAIT_BLIND_EXTENSION", "1800"))
+
 # A sandbox's max-run-time IS the lifetime of a leaked sandbox (nothing else
 # reclaims one whose owner died). Observed episodes finish in <15 min, so 2 h
 # leaves a wide margin while cutting the cost of each leak 3x vs the old 6 h.
@@ -311,15 +316,42 @@ class EAISandbox:
         return proc.stdout.strip() if proc.returncode == 0 else "UNKNOWN"
 
     def _wait_running(self, timeout: float) -> None:
+        """Wait for RUNNING, pausing the clock while the control plane is blind.
+
+        `_state()` returns "UNKNOWN" when `eai job get` fails, which during an
+        outage means we cannot SEE the job -- not that it failed to start.
+        Charging that blind time against the deadline converts a control-plane
+        outage into a rollout failure, and (with raise_on_error=true) a rollout
+        failure into a dead training run. That is the same mistake as
+        classifying network errors as permanent; this is the third place it
+        appeared.
+
+        So blind polls extend the deadline instead of consuming it, bounded by
+        WAIT_BLIND_EXTENSION so a genuinely unreachable API cannot hang a
+        rollout forever. Observable non-RUNNING states (QUEUING) still consume
+        the deadline normally -- a cluster that is merely busy is real evidence.
+        """
         deadline = time.time() + timeout
+        blind_total = 0.0
+        blind_run = 0
+        poll = 5.0
         while time.time() < deadline:
             state = self._state()
             if state == "RUNNING":
                 return
             if state in _TERMINAL_STATES:
                 raise RuntimeError(f"EAISandbox {self.name}: job {self.job_id} reached {state} before RUNNING")
-            time.sleep(5)
-        raise RuntimeError(f"EAISandbox {self.name}: job {self.job_id} not RUNNING after {timeout}s")
+            if state == "UNKNOWN":
+                blind_run += 1
+                if blind_total < WAIT_BLIND_EXTENSION:
+                    deadline += poll
+                    blind_total += poll
+            else:
+                blind_run = 0
+            time.sleep(poll)
+        extra = f" (+{blind_total:.0f}s blind)" if blind_total else ""
+        raise RuntimeError(
+            f"EAISandbox {self.name}: job {self.job_id} not RUNNING after {timeout}s{extra}")
 
     def exec(self, command: str, timeout: float | None = None, user: str | None = None) -> str:
         """Execute a command in the sandbox job. ``user`` is ignored (fixed uid).
