@@ -248,6 +248,14 @@ class EAISandbox:
         job_name = "sbx_" + re.sub(r"[^a-z0-9_]", "_", name.lower())[:40] + "_" + self._sbx_id
         self._transfer_dir = os.path.join(TRANSFER_HOST_DIR, self._sbx_id)
 
+        # Stamp the owning trainer's job id onto the sandbox. Without it an
+        # orphan is only identifiable by AGE -- and after a trainer is killed
+        # its sandboxes are minutes old, so any age gate loose enough to catch
+        # them is loose enough to kill live ones. 258 orphans had to be reaped
+        # by hand on 2026-08-27 after a planned restart, holding ~1000 CPUs and
+        # starving the very run that replaced them. With this, "parent job is
+        # not alive" is an exact test.
+        parent_job = os.environ.get("EAI_JOB_ID", "")
         args = [
             "job", "new", "--preemptable",
             "-i", self.image,
@@ -255,6 +263,7 @@ class EAISandbox:
             "--max-run-time", str(max_run_time),
             "--data", TRANSFER_DATA_SPEC,
             "--name", job_name,
+            "--env", f"RLLM_PARENT_JOB={parent_job}",
             "--field", "id", "--no-header", "--format", "csv",
             "--", "sleep", "infinity",
         ]
