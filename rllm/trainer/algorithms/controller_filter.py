@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 _cache: dict[str, Any] = {"sig": None, "state": {}}
 
+# Gap that separates two episodes sharing a session id. A single rollout's
+# decisions are seconds to minutes apart (one per agent turn, and a rollout runs
+# ~10-13 min end to end); the same uid recurring in a later training step is
+# hours away. 30 min sits well clear of both.
+EPISODE_GAP_S = float(os.environ.get("RLLM_CONTROLLER_EPISODE_GAP_S", "1800"))
+
 
 def _enabled() -> bool:
     return (
@@ -45,7 +51,19 @@ def _load_state() -> dict[str, dict[str, Any]]:
     if sig == _cache["sig"]:
         return _cache["state"]
 
-    state: dict[str, dict[str, Any]] = {}
+    # A session id is `task_id:rollout_idx`, which is NOT unique across training
+    # steps: the same task reappears in a later step (and every task reappears
+    # once the epoch wraps -- 513 tasks at batch 8 means step ~64). Aggregating a
+    # session's whole history would mark it stopped forever, so from epoch 2
+    # onward every episode whose uid was EVER stopped would be dropped no matter
+    # what actually happened to it. With a ~22% stop rate in epoch 1 that would
+    # have roughly doubled the drop rate over steps 64-80 -- precisely the range
+    # the headline v3-core@80 result comes from.
+    #
+    # Decisions for one rollout are seconds to minutes apart, while the same uid
+    # recurs hours later (observed spans of 10.9h). So split each session's
+    # decisions on a large time gap and keep only the most recent run.
+    raw: dict[str, list[dict[str, Any]]] = {}
     for p in paths:
         try:
             with open(p) as f:
@@ -54,18 +72,30 @@ def _load_state() -> dict[str, dict[str, Any]]:
                         r = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    st = state.setdefault(
-                        r["session_id"],
-                        {"stopped": False, "audit": bool(r.get("audit")), "log_prod_s": 0.0, "decisions": 0},
-                    )
-                    st["decisions"] += 1
-                    s_t = float(r.get("s_t", 1.0))
-                    if r.get("eligible") and s_t > 0:
-                        st["log_prod_s"] += math.log(s_t)
-                    if r.get("action") == "stop":
-                        st["stopped"] = True
+                    raw.setdefault(r["session_id"], []).append(r)
         except OSError:
             continue
+
+    state: dict[str, dict[str, Any]] = {}
+    for sid, recs in raw.items():
+        recs.sort(key=lambda r: float(r.get("ts") or 0.0))
+        # Walk backwards to the start of the most recent contiguous run.
+        start = len(recs) - 1
+        while start > 0:
+            gap = float(recs[start].get("ts") or 0.0) - float(recs[start - 1].get("ts") or 0.0)
+            if gap > EPISODE_GAP_S:
+                break
+            start -= 1
+        st = {"stopped": False, "audit": False, "log_prod_s": 0.0, "decisions": 0}
+        for r in recs[start:]:
+            st["decisions"] += 1
+            st["audit"] = st["audit"] or bool(r.get("audit"))
+            s_t = float(r.get("s_t", 1.0))
+            if r.get("eligible") and s_t > 0:
+                st["log_prod_s"] += math.log(s_t)
+            if r.get("action") == "stop":
+                st["stopped"] = True
+        state[sid] = st
     _cache["sig"] = sig
     _cache["state"] = state
     return state
