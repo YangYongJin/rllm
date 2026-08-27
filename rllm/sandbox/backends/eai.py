@@ -69,19 +69,75 @@ _TRANSIENT_ERRS = (
     "no response", "token is invalid", "context deadline exceeded",
 )
 
+# Network-layer failures raised by the CLI's Go HTTP client: DNS lookup
+# failures, refused connections, dead routes. These are strictly *connectivity*
+# problems -- the request never reached the API -- so retrying is safe and the
+# operation definitionally did not take effect (unlike a 502, where the server
+# may well have acted before failing to answer).
+#
+# Kept separate from _TRANSIENT_ERRS because the two are retried under
+# different conditions: control-plane calls retry on either, while `job exec`
+# retries a network error only on exit 7 (transport failure before the remote
+# command ran) -- a *test* that legitimately prints "connection refused" and
+# exits 1 must not be re-executed.
+#
+# Observed 2026-08-26 ~18:30-19:00 UTC: a control-plane outage produced
+# `dial tcp ...: connect: connection refused` and DNS `server misbehaving`.
+# Neither was on the transient list, so sandbox submission raised on the first
+# attempt and killed ALL FOUR training arms mid-run (v2@53, v3@51, v3full@4,
+# rejection@3) within 30 minutes of each other.
+_NETWORK_ERRS = (
+    "dial tcp", "connection refused", "connection reset", "no such host",
+    "server misbehaving", "i/o timeout", "network is unreachable",
+    "no route to host", "temporary failure in name resolution",
+    "tls handshake timeout",
+    # Go renders a truncated response as `Post "...": EOF`. Matched with the
+    # punctuation so it cannot hit an unrelated word containing "eof".
+    ": eof", "unexpected eof",
+)
 
-def _is_transient(err: str) -> bool:
-    """True if `err` is a CLI/control-plane failure worth retrying.
 
-    Requires a CLI error marker: the transient list contains bare status codes
-    ("502"), and a *remote command*'s output can easily contain those digits
-    (line numbers, test ids, hashes). Matching them without a marker would
-    re-run side-effecting agent/verifier commands that had actually executed.
+def _has_cli_marker(err: str) -> bool:
+    """True if `err` looks like CLI output rather than remote command output.
+
+    The transient lists contain bare status codes ("502") and short tokens
+    ("eof"), and a *remote command*'s output can easily contain those (line
+    numbers, test ids, hashes). Matching them without a marker would re-run
+    side-effecting agent/verifier commands that had actually executed.
     """
     low = (err or "").lower()
-    if "error:" not in low and "http:" not in low:
+    return "error:" in low or "http:" in low
+
+
+def _is_transient(err: str) -> bool:
+    """True if `err` is a CLI/control-plane HTTP failure worth retrying."""
+    if not _has_cli_marker(err):
         return False
+    low = (err or "").lower()
     return any(t in low for t in _TRANSIENT_ERRS)
+
+
+def _is_network_error(err: str) -> bool:
+    """True if `err` is a connectivity failure that never reached the API."""
+    if not _has_cli_marker(err):
+        return False
+    low = (err or "").lower()
+    return any(t in low for t in _NETWORK_ERRS)
+
+
+def _is_retryable_control_plane(err: str) -> bool:
+    """Retry predicate for control-plane calls (submit / kill / ls / info).
+
+    Superset of `_is_transient`: these calls do not execute anything inside a
+    sandbox, so riding out a network outage costs nothing but latency, whereas
+    giving up costs an entire multi-hour training run.
+    """
+    return _is_transient(err) or _is_network_error(err)
+
+# Submission retry ladder length. 10 attempts of min(300, 10*2^n) backoff is
+# ~25 min of tolerance for a control-plane outage. Env-tunable so a run can be
+# made more or less patient without a code change.
+SUBMIT_ATTEMPTS = max(1, int(os.environ.get("RLLM_EAI_SUBMIT_ATTEMPTS", "10")))
 
 # A sandbox's max-run-time IS the lifetime of a leaked sandbox (nothing else
 # reclaims one whose owner died). Observed episodes finish in <15 min, so 2 h
@@ -134,7 +190,10 @@ def _kill_job(job_id: str, attempts: int = 4) -> tuple[bool, str]:
             # Already terminal or already gone: nothing left to kill.
             if "cannot cancel a job that is in state" in low or "not found" in low:
                 return True, "already terminal"
-            if not _is_transient(last_err):
+            # Network errors count too: during an outage every kill fails, and
+            # giving up early is exactly how sandboxes leak. What this ladder
+            # still cannot kill goes to the leak log for the reaper.
+            if not _is_retryable_control_plane(last_err):
                 break
         if attempt < attempts - 1:
             time.sleep(5 * 2**attempt)
@@ -195,14 +254,17 @@ class EAISandbox:
             "--", "sleep", "infinity",
         ]
         proc = None
-        for attempt in range(7):
+        for attempt in range(SUBMIT_ATTEMPTS):
             proc = _eai(*args, timeout=180)
             if proc.returncode == 0:
                 break
-            # EAI API 5xx blips are transient; back off and retry. Ladder
-            # totals ~10 min to ride out multi-minute control-plane flaps
-            # (observed 2026-08-23 and 2026-08-25).
-            if attempt < 6 and any(t in (proc.stderr or "") for t in _TRANSIENT_ERRS):
+            # EAI API 5xx blips and network outages are transient; back off and
+            # retry. The ladder totals ~25 min (10,20,40,80,160,300,300,...) to
+            # ride out a full control-plane outage, not just a flap. Blocking
+            # one rollout for 25 min is far cheaper than losing the run: the
+            # 2026-08-26 outage killed four multi-hour trainings because the
+            # old ~10 min ladder never even engaged for network errors.
+            if attempt < SUBMIT_ATTEMPTS - 1 and _is_retryable_control_plane(proc.stderr or ""):
                 time.sleep(min(300, 10 * 2**attempt))
                 continue
             break
@@ -289,7 +351,12 @@ class EAISandbox:
             # that merely PRINTS "502" (line numbers, hashes, test ids) and
             # exits 1 is not re-executed — re-running a side-effecting agent
             # or verifier command would corrupt the episode.
-            transient = _is_transient(err)
+            # A network error is only safe to retry when the CLI failed in
+            # transport (exit 7), i.e. the remote command provably never ran.
+            # On exit 1 the command DID run and merely printed something that
+            # looks like a connectivity error -- re-running it would corrupt
+            # the episode.
+            transient = _is_transient(err) or (_is_network_error(err) and proc.returncode == 7)
             if attempt < 5 and transient and proc.returncode in (1, 7):
                 time.sleep(min(120, 8 * 2**attempt))
                 continue
