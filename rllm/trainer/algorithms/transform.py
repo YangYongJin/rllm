@@ -115,13 +115,6 @@ def _build_trajectory_groups(episodes: list[Episode], compact_filtering_config: 
     trajectories_by_name: dict[str, list[Trajectory]] = defaultdict(list)
     metadata_by_name: dict[str, list[dict]] = defaultdict(list)
 
-    # Rollout-control: stopped non-audit episodes have unknown terminal reward
-    # and must not enter the update (never as zero-reward). Inert unless the
-    # continuation controller is enabled. See algorithms/controller_filter.py.
-    from rllm.trainer.algorithms.controller_filter import controller_episode_filter
-
-    episodes, _controller_metrics = controller_episode_filter(episodes)
-
     for episode in episodes:
         termination_reason = episode.termination_reason or TerminationReason.UNKNOWN
         # skip episode if it should be masked by compact filtering
@@ -251,10 +244,26 @@ def transform_episodes_to_trajectory_groups(
         if len(rename_warnings) > LOG_N_WARNINGS:
             logger.debug(f"Skipping {len(rename_warnings) - LOG_N_WARNINGS} more similar trajectory name warnings")
 
+    # Step 1b: Rollout-control filter. A controller-stopped rollout has an
+    # UNKNOWN terminal reward and must never enter the update as a zero-reward
+    # sample; audits ran to completion and stay. Inert unless the continuation
+    # controller is enabled.
+    #
+    # Applied HERE rather than inside the default grouping hook for two
+    # reasons: the drop is a correctness requirement that must hold for ANY
+    # grouping strategy, and the hook's signature returns only groups, so
+    # metrics computed inside it were silently discarded --
+    # `controller/episodes_dropped_stopped` never reached W&B, leaving the
+    # single most important number about the method unlogged.
+    from rllm.trainer.algorithms.controller_filter import controller_episode_filter
+
+    episodes, controller_metrics = controller_episode_filter(episodes)
+
     # Step 2: Invoke the trajectory grouping hook
     groups = traj_grouping_hook(episodes, transform_config, compact_filtering_config)
 
     # Step 3: Get metrics
     metrics = _get_transform_metrics(episodes, groups, prefix=metrics_prefix)
+    metrics.update(controller_metrics)
 
     return groups, metrics
