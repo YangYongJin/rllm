@@ -139,6 +139,18 @@ def _is_retryable_control_plane(err: str) -> bool:
 # made more or less patient without a code change.
 SUBMIT_ATTEMPTS = max(1, int(os.environ.get("RLLM_EAI_SUBMIT_ATTEMPTS", "10")))
 
+# Ceiling on a single `job exec` when the caller passes no timeout of its own.
+# Was hardcoded at 3600s, which makes ONE hung remote command block a rollout
+# for an hour -- and with retry_limit=3 the rollout can hold its batch for
+# three. Observed 2026-08-27: v3-core's step-60 validation sat at 63/64 for
+# 45+ minutes on `Attempt 1/3 failed: TimeoutExpired(['eai','job','exec',...])`,
+# stalling the arm on the critical path.
+#
+# 900s still allows a genuinely long verifier test suite (episodes complete in
+# well under 15 min end to end) while cutting the worst-case straggler cost 4x.
+# Env-tunable so a long-horizon experiment can raise it without a code change.
+EXEC_TIMEOUT_S = float(os.environ.get("RLLM_EAI_EXEC_TIMEOUT_S", "900"))
+
 # How much time `_wait_running` may spend BLIND (control plane unreachable)
 # without it counting against the startup deadline. Bounded so a permanently
 # unreachable API still fails the rollout rather than hanging it forever.
@@ -379,7 +391,7 @@ class EAISandbox:
         for attempt in range(6):
             proc = _eai(
                 "job", "exec", self.job_id, "--", "bash", "-c", remote,
-                timeout=(timeout + 60) if timeout is not None else 3600,
+                timeout=(timeout + 60) if timeout is not None else EXEC_TIMEOUT_S,
             )
             if proc.returncode == 0:
                 break
