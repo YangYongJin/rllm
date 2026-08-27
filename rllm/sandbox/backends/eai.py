@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shutil
+import random
 import subprocess
 import time
 import uuid
@@ -186,6 +187,20 @@ def _record_leak(job_id: str, name: str, err: str) -> None:
         logger.exception("failed to record leaked sandbox %s", job_id)
 
 
+
+def _backoff(base: float, attempt: int, cap: float) -> float:
+    """Exponential backoff with full jitter.
+
+    Without jitter every sandbox that fails in the same outage retries at the
+    SAME instants -- 400+ clients hitting the control plane in lockstep, which
+    is a self-inflicted thundering herd and makes recovery harder for whoever
+    else is on the cluster. Full jitter (sleep ~ U[0, min(cap, base*2^n)]) is
+    the AWS-recommended form: it decorrelates retries and, in simulation,
+    completes work in less total time than equal-jitter or no jitter.
+    """
+    return random.uniform(0.0, min(cap, base * (2 ** attempt)))
+
+
 def _kill_job(job_id: str, attempts: int = 4) -> tuple[bool, str]:
     """Best-effort kill with a short retry ladder. Returns (killed, last_error).
 
@@ -213,7 +228,7 @@ def _kill_job(job_id: str, attempts: int = 4) -> tuple[bool, str]:
             if not _is_retryable_control_plane(last_err):
                 break
         if attempt < attempts - 1:
-            time.sleep(5 * 2**attempt)
+            time.sleep(_backoff(5, attempt, 60))
     return False, last_err
 
 
@@ -291,7 +306,7 @@ class EAISandbox:
             # 2026-08-26 outage killed four multi-hour trainings because the
             # old ~10 min ladder never even engaged for network errors.
             if attempt < SUBMIT_ATTEMPTS - 1 and _is_retryable_control_plane(proc.stderr or ""):
-                time.sleep(min(300, 10 * 2**attempt))
+                time.sleep(_backoff(10, attempt, 300))
                 continue
             break
         if proc.returncode != 0:
@@ -411,7 +426,7 @@ class EAISandbox:
             # the episode.
             transient = _is_transient(err) or (_is_network_error(err) and proc.returncode == 7)
             if attempt < 5 and transient and proc.returncode in (1, 7):
-                time.sleep(min(120, 8 * 2**attempt))
+                time.sleep(_backoff(8, attempt, 120))
                 continue
             break
         if proc.returncode != 0:

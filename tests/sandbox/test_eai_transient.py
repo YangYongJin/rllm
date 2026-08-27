@@ -175,3 +175,38 @@ def test_terminal_state_fails_fast_even_when_blind_extension_is_large(monkeypatc
     with _p.raises(RuntimeError, match="reached"):
         _run_wait(["UNKNOWN", "UNKNOWN", "FAILED"], timeout=60.0,
                   blind_ext=1800.0, monkeypatch=monkeypatch)
+
+
+# --- retry jitter -----------------------------------------------------------
+# Without jitter every sandbox failing in the same outage retries at identical
+# instants: 400+ clients hitting the control plane in lockstep. That is a
+# self-inflicted thundering herd and makes recovery harder for every tenant.
+
+def test_backoff_is_jittered_not_deterministic():
+    from rllm.sandbox.backends.eai import _backoff
+    vals = {_backoff(10, 3, 300) for _ in range(50)}
+    assert len(vals) > 40, "backoff is deterministic; concurrent retries stay synchronized"
+
+
+def test_backoff_respects_the_cap():
+    from rllm.sandbox.backends.eai import _backoff
+    assert all(0.0 <= _backoff(10, 20, 300) <= 300 for _ in range(200))
+
+
+def test_backoff_grows_with_attempt_in_expectation():
+    from rllm.sandbox.backends.eai import _backoff
+    early = sum(_backoff(10, 1, 300) for _ in range(300)) / 300
+    late = sum(_backoff(10, 4, 300) for _ in range(300)) / 300
+    assert late > early * 2, "later attempts must wait longer on average"
+
+
+def test_concurrent_callers_get_different_delays():
+    """The property that actually matters: N clients do not retry together."""
+    from rllm.sandbox.backends.eai import _backoff
+    delays = [_backoff(10, 2, 300) for _ in range(100)]
+    # No more than a few should land within 100ms of each other.
+    buckets = {}
+    for d in delays:
+        buckets.setdefault(round(d, 1), 0)
+        buckets[round(d, 1)] += 1
+    assert max(buckets.values()) < 15, f"retries clustered: {max(buckets.values())}/100 in one 100ms bucket"
