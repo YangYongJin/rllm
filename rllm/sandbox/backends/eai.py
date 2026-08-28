@@ -453,9 +453,19 @@ class EAISandbox:
         """
         import urllib.request
 
-        ip = self._pod_ip()
+        # The IP fetch is the ONLY control-plane call between creation and a
+        # fully API-independent sandbox — worth a real ladder. Empirical
+        # proof (2026-08-28 21:2x): a canary's server answered /health over
+        # the pod network while `eai job exec` 502'd simultaneously; the lone
+        # unretried job-info call was all that kept exec on the CLI path.
+        ip = None
+        for attempt in range(8):
+            ip = self._pod_ip()
+            if ip:
+                break
+            time.sleep(_backoff(5, attempt, 60))
         if not ip:
-            logger.info("EAISandbox %s: no pod IP; exec stays on CLI", self.name)
+            logger.info("EAISandbox %s: no pod IP after retries; exec stays on CLI", self.name)
             return
         self._http_url = f"http://{ip}:{HTTP_EXEC_PORT}"
         for _ in range(HTTP_HEALTH_TRIES):
