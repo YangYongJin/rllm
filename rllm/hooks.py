@@ -262,10 +262,28 @@ class SandboxTaskHooks:
                 # CLI install, unless the image already contains exactly this
                 # script (baked_install, recorded at snapshot boot).
                 if install and getattr(sandbox, "baked_install", "") != install:
-                    try:
-                        sandbox.exec(install, timeout=getattr(agent_flow, "install_timeout", env_int("RLLM_HARNESS_INSTALL_TIMEOUT_S", 600)), user="root")
-                    except Exception as e:
-                        raise RuntimeError(f"Failed to install {getattr(agent_flow, 'name', type(agent_flow).__name__)} in sandbox: {e}") from e
+                    # The install script is IDEMPOTENT by contract (guarded by
+                    # `command -v`), so unlike agent/verifier commands it is
+                    # safe to re-execute through a control-plane flap. The
+                    # inner exec ladder caps at ~5 min; a 502 outage on
+                    # 2026-08-28 outlasted it and killed a training arm during
+                    # val_before_train. This outer ladder stretches total
+                    # patience to ~20 min, matching the submit ladder.
+                    import time as _time
+
+                    install_timeout = getattr(agent_flow, "install_timeout", env_int("RLLM_HARNESS_INSTALL_TIMEOUT_S", 600))
+                    last_err: Exception | None = None
+                    for _attempt in range(4):
+                        try:
+                            sandbox.exec(install, timeout=install_timeout, user="root")
+                            last_err = None
+                            break
+                        except Exception as e:
+                            last_err = e
+                            if _attempt < 3:
+                                _time.sleep(min(60 * (_attempt + 1), 180))
+                    if last_err is not None:
+                        raise RuntimeError(f"Failed to install {getattr(agent_flow, 'name', type(agent_flow).__name__)} in sandbox: {last_err}") from last_err
 
             evaluator = self.evaluation.resolve(task, sandbox, plan.verifier_kind, plan.verifier_config)
         except BaseException:
