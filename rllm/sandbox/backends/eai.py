@@ -67,7 +67,11 @@ HTTP_EXEC_ENABLED = os.environ.get("RLLM_EAI_HTTP_EXEC", "0") in ("1", "true", "
 HTTP_EXEC_PORT = int(os.environ.get("RLLM_EAI_HTTP_EXEC_PORT", "8642"))
 # Server startup is image-python + a few imports; poll briefly after RUNNING.
 HTTP_HEALTH_TRIES = int(os.environ.get("RLLM_EAI_HTTP_HEALTH_TRIES", "20"))
-HTTP_HEALTH_INTERVAL_S = 2.0
+HTTP_HEALTH_INTERVAL_S = float(os.environ.get("RLLM_EAI_HTTP_HEALTH_INTERVAL_S", "2.0"))
+
+# Images whose server never came up (python too old, etc.) — skip the probe
+# window for all later sandboxes of the same image within this process.
+_http_probe_failed_images: set[str] = set()
 
 _server_script_remote: str | None = None
 
@@ -340,21 +344,29 @@ class EAISandbox:
         # inside the sandbox for debugging.
         self._http_ok = False
         self._exec_token = ""
+        self._http_enabled_here = False
         job_cmd: list[str] = ["sleep", "infinity"]
         env_args: list[str] = ["--env", f"RLLM_PARENT_JOB={parent_job}"]
-        if HTTP_EXEC_ENABLED:
-            self._exec_token = uuid.uuid4().hex
-            server_path = _ensure_server_script()
-            launcher = (
-                'PY=$(command -v python3 || command -v python); '
-                f'[ -n "$PY" ] && nohup "$PY" {server_path} >/tmp/exec_server.log 2>&1 & '
-                "exec sleep infinity"
-            )
-            job_cmd = ["bash", "-c", launcher]
-            env_args += [
-                "--env", f"RLLM_EXEC_TOKEN={self._exec_token}",
-                "--env", f"RLLM_EXEC_PORT={HTTP_EXEC_PORT}",
-            ]
+        if HTTP_EXEC_ENABLED and self.image not in _http_probe_failed_images:
+            # A deploy failure (VAST hiccup) must degrade to a plain CLI
+            # sandbox, never fail creation — this feature may only ever
+            # REDUCE control-plane dependence.
+            try:
+                server_path = _ensure_server_script()
+                self._exec_token = uuid.uuid4().hex
+                launcher = (
+                    'PY=$(command -v python3 || command -v python); '
+                    f'[ -n "$PY" ] && nohup "$PY" -u {server_path} >/tmp/exec_server.log 2>&1 & '
+                    "exec sleep infinity"
+                )
+                job_cmd = ["bash", "-c", launcher]
+                env_args += [
+                    "--env", f"RLLM_EXEC_TOKEN={self._exec_token}",
+                    "--env", f"RLLM_EXEC_PORT={HTTP_EXEC_PORT}",
+                ]
+                self._http_enabled_here = True
+            except Exception as exc:
+                logger.warning("EAISandbox %s: exec-server deploy failed (%s); CLI exec only", name, exc)
 
         args = [
             "job", "new", "--preemptable",
@@ -418,7 +430,7 @@ class EAISandbox:
             except Exception:
                 pass
             raise
-        if HTTP_EXEC_ENABLED:
+        if self._http_enabled_here:
             self._probe_http_exec()
         logger.info(
             "EAISandbox %s created (job: %s, image: %s, exec: %s)",
@@ -455,7 +467,11 @@ class EAISandbox:
             except Exception:
                 pass
             time.sleep(HTTP_HEALTH_INTERVAL_S)
-        logger.info("EAISandbox %s: exec server unreachable after %d probes; exec stays on CLI", self.name, HTTP_HEALTH_TRIES)
+        # Negative-cache the IMAGE: a python too old to run the server fails
+        # identically every time — don't pay the probe window (40s+) on every
+        # sandbox of that task family.
+        _http_probe_failed_images.add(self.image)
+        logger.info("EAISandbox %s: exec server unreachable after %d probes; exec stays on CLI (image %s negative-cached)", self.name, HTTP_HEALTH_TRIES, self.image)
 
     def _http_exec(self, wrapped: str, timeout: float | None) -> str:
         """Run *wrapped* via the in-sandbox server.
@@ -502,7 +518,9 @@ class EAISandbox:
             raise RuntimeError(
                 f"Command transport failed in sandbox {self.name} [http, post-send, may have executed]: {exc}"
             ) from exc
-        rc = payload["returncode"]
+        rc = payload.get("returncode")
+        if rc is None:
+            raise RuntimeError(f"Command transport failed in sandbox {self.name} [http]: malformed response {str(payload)[:200]!r}")
         if rc != 0:
             err = payload.get("stderr", "")
             logger.debug(

@@ -25,6 +25,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -34,31 +35,59 @@ MAX_OUTPUT = 8 * 1024 * 1024  # per stream; CLI tails were capped anyway
 DEFAULT_TIMEOUT = float(os.environ.get("RLLM_EXEC_DEFAULT_TIMEOUT", "900"))
 
 
+def _tail(f):
+    # Return the LAST MAX_OUTPUT bytes — for diagnosis the tail beats the
+    # head, and callers historically consumed tails.
+    f.seek(0, os.SEEK_END)
+    size = f.tell()
+    f.seek(max(0, size - MAX_OUTPUT))
+    return f.read(MAX_OUTPUT)
+
+
 def _run(cmd, timeout):
-    # start_new_session so a timeout can kill the whole process tree, not
-    # just the shell (agents spawn long pipelines).
-    proc = subprocess.Popen(
-        ["bash", "-c", cmd],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid,
-    )
-    try:
-        out, err = proc.communicate(timeout=timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
+    # Output goes to TEMP FILES, not pipes: with pipes, communicate() waits
+    # for EOF rather than process exit, so any backgrounded child that
+    # inherits stdout/stderr (`cmd &`) turned an instant exit into a
+    # full-timeout stall and a false rc=124 — and a daemonized escapee could
+    # hang the handler thread forever. wait() doesn't care who holds the
+    # file descriptors. This also bounds memory: nothing is buffered in RAM.
+    # start_new_session (C-level, thread-safe — preexec_fn is not under a
+    # threading server) so a timeout can kill the whole process tree.
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(
+            ["bash", "-c", cmd],
+            stdout=out_f,
+            stderr=err_f,
+            start_new_session=True,
+        )
+        timed_out = False
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        out, err = proc.communicate()
-        rc = 124
-        err = (err or b"") + b"\n[exec_server] timeout after %ds, process group killed" % int(timeout)
-    return rc, (out or b"")[:MAX_OUTPUT], (err or b"")[:MAX_OUTPUT]
+            proc.wait(timeout=timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            rc = 124
+        out = _tail(out_f)
+        err = _tail(err_f)
+        if timed_out:
+            err += b"\n[exec_server] timeout after %ds, process group killed" % int(timeout)
+    return rc, out, err
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Socket read timeout: a client that connects and never sends (slowloris,
+    # broken peer) releases its thread instead of holding it forever. Does
+    # NOT bound /exec runtime — that wait happens after the request is read.
+    timeout = 60
 
     def _reply(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
