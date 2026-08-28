@@ -54,6 +54,55 @@ TRANSFER_DATA_SPEC = os.environ.get(
 )
 TRANSFER_REMOTE_DIR = "/mnt/rc_transfer"
 
+# ---------------------------------------------------------------------------
+# HTTP exec (data-plane): opt-in via RLLM_EAI_HTTP_EXEC=1. The sandbox job
+# boots rllm/sandbox/exec_server.py (served from the transfer mount) and the
+# trainer execs over pod-to-pod HTTP; the control plane is then only touched
+# at create/kill. Every historical run-killing incident on this cluster was a
+# control-plane interaction (EAI_AUDIT.md), and ~75% of per-rollout API calls
+# are execs. Falls back to CLI exec per-sandbox when the server is
+# unreachable (image python too old, server died), so enabling it can only
+# reduce API dependence, never add a failure mode.
+HTTP_EXEC_ENABLED = os.environ.get("RLLM_EAI_HTTP_EXEC", "0") in ("1", "true", "True")
+HTTP_EXEC_PORT = int(os.environ.get("RLLM_EAI_HTTP_EXEC_PORT", "8642"))
+# Server startup is image-python + a few imports; poll briefly after RUNNING.
+HTTP_HEALTH_TRIES = int(os.environ.get("RLLM_EAI_HTTP_HEALTH_TRIES", "20"))
+HTTP_HEALTH_INTERVAL_S = 2.0
+
+_server_script_remote: str | None = None
+
+
+def _ensure_server_script() -> str:
+    """Copy exec_server.py into the shared transfer dir, content-addressed.
+
+    Content-hash naming makes deployments immutable: a running sandbox can
+    never see the script change under it (the mounted-launcher mutation race,
+    already bitten once elsewhere), and every rllm version publishes its own
+    file. Returns the IN-SANDBOX path.
+    """
+    global _server_script_remote
+    if _server_script_remote is not None:
+        return _server_script_remote
+    import hashlib
+
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "exec_server.py")
+    with open(src, "rb") as f:
+        content = f.read()
+    digest = hashlib.sha256(content).hexdigest()[:12]
+    host_path = os.path.join(TRANSFER_HOST_DIR, f"exec_server_{digest}.py")
+    if not os.path.exists(host_path):
+        tmp = host_path + f".tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            f.write(content)
+        os.replace(tmp, host_path)
+    _server_script_remote = f"{TRANSFER_REMOTE_DIR}/exec_server_{digest}.py"
+    return _server_script_remote
+
+
+class _HttpExecTransportError(RuntimeError):
+    """Exec-server unreachable BEFORE the command was sent — CLI fallback is safe."""
+
+
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"}
 
 # CLI failures worth retrying. Beyond control-plane 5xx, this includes
@@ -283,6 +332,30 @@ class EAISandbox:
         # starving the very run that replaced them. With this, "parent job is
         # not alive" is an exact test.
         parent_job = os.environ.get("EAI_JOB_ID", "")
+
+        # HTTP exec: boot the in-sandbox server in the background and keep
+        # `sleep infinity` as the job's main process — a crashed/unstartable
+        # server (image python too old, etc.) must degrade to CLI exec, not
+        # kill the sandbox. Server stderr lands in /tmp/exec_server.log
+        # inside the sandbox for debugging.
+        self._http_ok = False
+        self._exec_token = ""
+        job_cmd: list[str] = ["sleep", "infinity"]
+        env_args: list[str] = ["--env", f"RLLM_PARENT_JOB={parent_job}"]
+        if HTTP_EXEC_ENABLED:
+            self._exec_token = uuid.uuid4().hex
+            server_path = _ensure_server_script()
+            launcher = (
+                'PY=$(command -v python3 || command -v python); '
+                f'[ -n "$PY" ] && nohup "$PY" {server_path} >/tmp/exec_server.log 2>&1 & '
+                "exec sleep infinity"
+            )
+            job_cmd = ["bash", "-c", launcher]
+            env_args += [
+                "--env", f"RLLM_EXEC_TOKEN={self._exec_token}",
+                "--env", f"RLLM_EXEC_PORT={HTTP_EXEC_PORT}",
+            ]
+
         args = [
             "job", "new", "--preemptable",
             "-i", self.image,
@@ -290,9 +363,9 @@ class EAISandbox:
             "--max-run-time", str(max_run_time),
             "--data", TRANSFER_DATA_SPEC,
             "--name", job_name,
-            "--env", f"RLLM_PARENT_JOB={parent_job}",
+            *env_args,
             "--field", "id", "--no-header", "--format", "csv",
-            "--", "sleep", "infinity",
+            "--", *job_cmd,
         ]
         proc = None
         for attempt in range(SUBMIT_ATTEMPTS):
@@ -345,7 +418,101 @@ class EAISandbox:
             except Exception:
                 pass
             raise
-        logger.info("EAISandbox %s created (job: %s, image: %s)", name, self.job_id, self.image)
+        if HTTP_EXEC_ENABLED:
+            self._probe_http_exec()
+        logger.info(
+            "EAISandbox %s created (job: %s, image: %s, exec: %s)",
+            name, self.job_id, self.image, "http" if self._http_ok else "cli",
+        )
+
+    def _pod_ip(self) -> str | None:
+        """Routable pod IP of the sandbox's live run, from `eai job info`."""
+        proc = _eai("job", "info", self.job_id, timeout=60)
+        if proc.returncode != 0:
+            return None
+        ips = re.findall(r"^\s*ip:\s*(\d+\.\d+\.\d+\.\d+)\s*$", proc.stdout, re.MULTILINE)
+        return ips[-1] if ips else None
+
+    def _probe_http_exec(self) -> None:
+        """Health-check the in-sandbox server; on success switch exec to HTTP.
+
+        Never raises: a sandbox with an unreachable server simply stays on
+        the CLI path (image lacks python3, server crashed, network oddity).
+        """
+        import urllib.request
+
+        ip = self._pod_ip()
+        if not ip:
+            logger.info("EAISandbox %s: no pod IP; exec stays on CLI", self.name)
+            return
+        self._http_url = f"http://{ip}:{HTTP_EXEC_PORT}"
+        for _ in range(HTTP_HEALTH_TRIES):
+            try:
+                with urllib.request.urlopen(f"{self._http_url}/health", timeout=5) as resp:
+                    if resp.status == 200:
+                        self._http_ok = True
+                        return
+            except Exception:
+                pass
+            time.sleep(HTTP_HEALTH_INTERVAL_S)
+        logger.info("EAISandbox %s: exec server unreachable after %d probes; exec stays on CLI", self.name, HTTP_HEALTH_TRIES)
+
+    def _http_exec(self, wrapped: str, timeout: float | None) -> str:
+        """Run *wrapped* via the in-sandbox server.
+
+        Double-execution safety mirrors the CLI path's exit-7 rule: the POST
+        is sent EXACTLY once. Before sending, an idempotent /health preflight
+        (retried) proves the server is reachable — a preflight failure means
+        the command was never sent, which is the only case where the caller
+        may safely fall back to CLI exec (signalled by
+        :class:`_HttpExecTransportError`). A failure AFTER the POST is
+        ambiguous (the command may be running server-side) and raises a plain
+        RuntimeError — the rollout-level retry then starts a FRESH sandbox,
+        which is always safe.
+        """
+        import urllib.error
+        import urllib.request
+
+        eff_timeout = float(timeout) if timeout is not None else float(EXEC_TIMEOUT_S)
+
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(f"{self._http_url}/health", timeout=5) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception as exc:
+                if attempt == 2:
+                    self._http_ok = False
+                    logger.warning("EAISandbox %s: exec-server preflight failed (%s); falling back to CLI exec", self.name, exc)
+                    raise _HttpExecTransportError(str(exc))
+                time.sleep(2)
+
+        body = json.dumps({"cmd": wrapped, "timeout": eff_timeout}).encode()
+        req = urllib.request.Request(
+            f"{self._http_url}/exec",
+            data=body,
+            headers={"Content-Type": "application/json", "X-RLLM-Token": self._exec_token},
+        )
+        try:
+            # Client timeout comfortably beyond the server-side one: the
+            # server enforces the real limit and reports rc=124.
+            with urllib.request.urlopen(req, timeout=eff_timeout + 90) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Command transport failed in sandbox {self.name} [http, post-send, may have executed]: {exc}"
+            ) from exc
+        rc = payload["returncode"]
+        if rc != 0:
+            err = payload.get("stderr", "")
+            logger.debug(
+                "Command failed (exit %d) in sandbox %s [http]: %s\nstdout (tail):\n%s\nstderr (tail):\n%s",
+                rc, self.name, wrapped, payload.get("stdout", "")[-8000:], err[-8000:],
+            )
+            raise RuntimeError(
+                f"Command failed (exit {rc}) in sandbox {self.name}: {wrapped}\nstderr (tail):\n{err[-600:]}"
+            )
+        return payload.get("stdout", "")
 
     def _state(self) -> str:
         proc = _eai("job", "get", self.job_id, "--field", "state", timeout=60)
@@ -399,6 +566,14 @@ class EAISandbox:
         if user is not None:
             logger.debug("EAISandbox %s: ignoring user=%r (jobs run as a fixed uid)", self.name, user)
         wrapped = "export HOME=/tmp; " + command
+        # Data-plane exec first: pod-to-pod HTTP to the in-sandbox server, no
+        # control plane involved. Only a PRE-SEND transport failure falls
+        # back to the CLI path (the command was provably never started).
+        if self._http_ok:
+            try:
+                return self._http_exec(wrapped, timeout)
+            except _HttpExecTransportError:
+                pass
         remote = wrapped
         if timeout is not None:
             remote = f"timeout {int(timeout)} bash -c {_shquote(wrapped)}"
