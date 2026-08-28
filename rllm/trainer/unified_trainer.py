@@ -848,7 +848,7 @@ class UnifiedTrainer:
         test_begin = time.perf_counter()
         self.agent_workflow_engine.set_training_step(trainer_state.global_step, mode="val", epoch=trainer_state.epoch)
 
-        is_correct_lst, uid_lst, data_source_lst = [], [], []
+        is_correct_lst, uid_lst, data_source_lst, is_error_lst = [], [], [], []
         workflow_metrics_by_source = defaultdict(lambda: defaultdict(list))
 
         for batch in self._val_dataloader:
@@ -864,6 +864,12 @@ class UnifiedTrainer:
 
             is_correct_lst.extend([episode.is_correct for episode in val_episodes])
             uid_lst.extend([episode.task_id for episode in val_episodes])
+            # Infra-failure accounting: with raise_on_error=false an episode
+            # that exhausted its retries (control-plane outage, sandbox death)
+            # arrives as ERROR/empty and would otherwise be indistinguishable
+            # from a model failure in pass@1 — a 35-min eai outage once dragged
+            # a step-0 val from ~0.40 to ~0.13 with no visible cause.
+            is_error_lst.extend([1.0 if (episode.termination_reason == TerminationReason.ERROR or not any(len(t.steps) > 0 for t in episode.trajectories)) else 0.0 for episode in val_episodes])
 
             data_sources = [episode.info.get("data_source", "unknown") for episode in val_episodes]
             data_source_lst.extend(data_sources)
@@ -884,6 +890,7 @@ class UnifiedTrainer:
         is_correct_array = np.array(is_correct_lst)
         uid_array = np.array(uid_lst)
         data_source_array = np.array(data_source_lst)
+        is_error_array = np.array(is_error_lst)
 
         for data_source in np.unique(data_source_array):
             pass_rates = defaultdict(list)
@@ -891,12 +898,20 @@ class UnifiedTrainer:
             data_source_mask = data_source_array == data_source
             is_correct_data_source = is_correct_array[data_source_mask]
             uids_data_source = uid_array[data_source_mask]
+            is_error_data_source = is_error_array[data_source_mask]
 
             for is_correct, uid in zip(is_correct_data_source, uids_data_source, strict=False):
                 pass_rates[uid].append(is_correct)
 
             val_metrics[f"val/{data_source}/pass@1"] = np.mean(is_correct_data_source)
             val_metrics[f"val/{data_source}/pass@{n_val_samples}"] = np.mean([1 if any(pass_rate) else 0 for pass_rate in pass_rates.values()])
+            # Infra health of THIS val pass. pass@1 counts errors as failures
+            # (conservative); pass@1_excl_error removes infra-failed episodes
+            # from the denominator. A large gap between the two means "eai was
+            # sick", not "the policy regressed" — read the curve accordingly.
+            val_metrics[f"val/{data_source}/error_rate"] = np.mean(is_error_data_source)
+            non_error = is_error_data_source == 0.0
+            val_metrics[f"val/{data_source}/pass@1_excl_error"] = np.mean(is_correct_data_source[non_error]) if non_error.any() else 0.0
 
             # Add workflow metrics for this data source
             if data_source in workflow_metrics_by_source:
