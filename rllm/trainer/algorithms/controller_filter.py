@@ -91,7 +91,12 @@ def _load_state() -> dict[str, dict[str, Any]]:
             st["decisions"] += 1
             st["audit"] = st["audit"] or bool(r.get("audit"))
             s_t = float(r.get("s_t", 1.0))
-            if r.get("eligible") and s_t > 0:
+            # floor_hold turns were overridden by the group floor / contrast
+            # guard: survival probability there was 1, not s_t. Folding their
+            # s_t into the product understates q and inflates 1/q toward
+            # w_max on exactly the floor-protected (rare, high-leverage)
+            # trajectories.
+            if r.get("eligible") and s_t > 0 and r.get("action") != "floor_hold":
                 st["log_prod_s"] += math.log(s_t)
             if r.get("action") == "stop":
                 st["stopped"] = True
@@ -101,16 +106,34 @@ def _load_state() -> dict[str, dict[str, Any]]:
     return state
 
 
+def _propensity_enabled() -> bool:
+    return os.environ.get("RLLM_CONTROLLER_PROPENSITY", "0") in ("1", "true", "True")
+
+
 def controller_episode_filter(episodes: list) -> tuple[list, dict[str, float]]:
     """Drop controller-stopped non-audit episodes; annotate the rest.
+
+    With ``RLLM_CONTROLLER_PROPENSITY=1`` (M7), surviving non-audit episodes
+    additionally get ``propensity_weight = min(1/Π s_t, w_max)`` stamped on
+    each trajectory. Audit membership is DETERMINISTIC per session (blake2b
+    hash in the gateway), so a non-audit's completion propensity is exactly
+    Π s_t — mixing in the audit fraction (q = a + (1−a)Πs) would bias the
+    surviving-sample gradient down precisely where selection pressure is
+    strongest. Audits are the always-complete anchor stream at weight 1; the
+    pooled estimator is unbiased. The advantage collector multiplies
+    advantages by this weight.
 
     Returns (kept_episodes, metrics). No-op passthrough when disabled.
     """
     if not _enabled():
         return episodes, {}
 
+    propensity_on = _propensity_enabled()
+    w_max = float(os.environ.get("RLLM_CONTROLLER_PROPENSITY_WMAX", "10.0"))
+
     state = _load_state()
     kept, dropped, audits = [], 0, 0
+    weights: list[float] = []
     for ep in episodes:
         uid = f"{ep.task_id}:{ep.rollout_idx}"
         st = state.get(uid)
@@ -130,6 +153,14 @@ def controller_episode_filter(episodes: list) -> tuple[list, dict[str, float]]:
             "decisions": st["decisions"],
         }
         ep.metadata = meta
+        if propensity_on and not st["audit"] and st["decisions"] > 0:
+            q = math.exp(st["log_prod_s"])
+            w = min(1.0 / max(q, 1e-6), w_max)
+            weights.append(w)
+            for traj in ep.trajectories:
+                tmeta = traj.metadata if isinstance(traj.metadata, dict) else {}
+                tmeta["propensity_weight"] = w
+                traj.metadata = tmeta
         kept.append(ep)
 
     metrics = {
@@ -137,6 +168,9 @@ def controller_episode_filter(episodes: list) -> tuple[list, dict[str, float]]:
         "controller/episodes_dropped_stopped": float(dropped),
         "controller/episodes_audit": float(audits),
     }
+    if propensity_on:
+        metrics["controller/propensity_weight_mean"] = float(sum(weights) / len(weights)) if weights else 1.0
+        metrics["controller/propensity_weight_max"] = float(max(weights)) if weights else 1.0
     if dropped:
         logger.info("[controller-filter] dropped %d stopped non-audit episode(s) of %d", dropped, len(episodes))
     return kept, metrics

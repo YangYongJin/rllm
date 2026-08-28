@@ -854,7 +854,12 @@ class UnifiedTrainer:
         for batch in self._val_dataloader:
             # Generate episodes and transform to trajectory groups
             val_episodes = await self.backend.generate_episodes(batch, agent_workflow_engine=self.agent_workflow_engine, is_validation=True)
-            val_trajectory_groups, _ = transform_episodes_to_trajectory_groups(val_episodes, self.transform_config, self.cf_config, traj_grouping_hook=self.traj_grouping_hook)
+            # Compact filtering is a TRAINING-loss concept (mask truncated
+            # episodes out of the gradient). At validation a truncated episode
+            # is a real failure and must stay in the metrics — filtering here
+            # would inflate val/reward/* exactly when truncation grows.
+            # (pass@k below is already computed from raw val_episodes.)
+            val_trajectory_groups, _ = transform_episodes_to_trajectory_groups(val_episodes, self.transform_config, None, traj_grouping_hook=self.traj_grouping_hook)
             reward_metrics = collect_reward_and_advantage_from_trajectory_groups(val_trajectory_groups, self.algorithm_config, collect_advantage=False)
 
             is_correct_lst.extend([episode.is_correct for episode in val_episodes])

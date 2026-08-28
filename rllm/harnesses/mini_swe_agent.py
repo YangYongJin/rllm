@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shlex
 
+from rllm.env import env_int
 from rllm.harnesses.cli_harness import BaseCliHarness
 from rllm.sandbox.protocol import Sandbox
 from rllm.types import AgentConfig, Task
@@ -69,7 +70,11 @@ if ! command -v mini-swe-agent >/dev/null 2>&1; then
     # ``TypeError: unsupported operand type(s) for |`` and exits before any
     # LLM call (zero traces, score 0). uv fetches a managed CPython 3.12 if
     # one isn't present; this venv is independent of the task's own python.
-    uv tool install --python 3.12 mini-swe-agent
+    # Pinned: the ``-c mini.yaml -c agent.step_limit=N`` layering and the
+    # LimitsExceeded exit contract are verified against this version. The
+    # guard above means snapshot images baked with an OLDER unpinned CLI
+    # keep it — cold per-episode sandboxes (the training path) always pin.
+    uv tool install --python 3.12 mini-swe-agent==2.4.6
 fi
 """
 
@@ -159,11 +164,18 @@ class MiniSweAgentHarness(BaseCliHarness):
         _, _, qualified = self.ensure_provider_prefix(config.model)
 
         # NOTE: gateway routing relies on ``OPENAI_API_BASE`` in the
-        # process environment. ``-c key=value`` overrides on the CLI
-        # are NOT layered on top of mini.yaml in v2 — they replace it,
-        # which breaks the build with missing ``system_template`` etc.
+        # process environment. A bare ``-c key=value`` override REPLACES
+        # the default config file (missing ``system_template`` etc.), but
+        # multiple ``-c`` specs merge recursively — so the step-limit
+        # override must re-include ``mini.yaml`` before layering on top.
+        # CAVEAT: ``-c mini.yaml`` resolves CWD-first (the task workdir) —
+        # a repo shipping a root-level ``mini.yaml`` would hijack the
+        # config. None of the 10 R2E-Gym-Lite repos does; re-audit this if
+        # the task pool changes.
         # The dotenv we write in :meth:`write_configs` carries the base
         # URL into the agent's environment so litellm picks it up.
+        max_turns = env_int("RLLM_AGENT_MAX_TURNS", 0)
+        step_limit = f"-c mini.yaml -c agent.step_limit={max_turns} " if max_turns > 0 else ""
         return (
             f"{self._cd_prefix(task)}"
             f'export PATH="$HOME/.local/bin:$PATH"; '
@@ -171,5 +183,6 @@ class MiniSweAgentHarness(BaseCliHarness):
             f"--model={shlex.quote(qualified)} "
             f"--task={shlex.quote(instruction)} "
             f"--exit-immediately "
+            f"{step_limit}"
             f"2>&1 | tee {shlex.quote(self.stdout_log_path)}"
         )

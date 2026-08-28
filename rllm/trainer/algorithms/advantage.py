@@ -228,8 +228,13 @@ def collect_reward_and_advantage_from_trajectory_groups(
                 assert len(advantages_by_traj) == len(traj_group.trajectories), "length mismatch between trajectory rewards and computed advantages"
                 advantages_by_role[group_role].extend(np.asarray(advantages_by_traj).tolist())  # for metrics calculation
                 for traj, advantage in zip(traj_group.trajectories, advantages_by_traj, strict=True):
+                    # Selection-aware importance weight (continuation controller
+                    # M7): survivors of stochastic stopping carry 1/q(τ) so the
+                    # surviving-sample gradient stays unbiased under selection.
+                    # Absent annotation → 1.0, a no-op.
+                    weight = float((traj.metadata or {}).get("propensity_weight", 1.0)) if isinstance(getattr(traj, "metadata", None), dict) else 1.0
                     for step in traj.steps:
-                        step.advantage = float(advantage)
+                        step.advantage = float(advantage) * weight
 
     # reduce metrics by group
     final_metrics = {}

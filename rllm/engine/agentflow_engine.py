@@ -33,6 +33,7 @@ from tqdm import tqdm
 
 from rllm.data.utils import task_from_row
 from rllm.engine.trace_converter import compute_step_metrics, trace_record_to_step
+from rllm.env import env_int
 from rllm.eval.types import EvalOutput
 from rllm.gateway.manager import container_reachable_url
 from rllm.types import AgentConfig, Episode, Step, Task, Trajectory, flow_accepts_env, run_agent_flow
@@ -146,6 +147,14 @@ def enrich_episode_with_traces(
     # Convert all traces to training steps
     training_steps = [trace_record_to_step(t) for t in traces]
 
+    # Termination cause inferred during enrichment. A trailing token-less
+    # trace means the episode ended because the final LLM call came back
+    # empty — overwhelmingly the prompt hitting max_model_len (vLLM 400 /
+    # empty body). Historically these were silently dropped and the episode
+    # kept its default ENV_DONE label, so 74% of 16k-context baseline
+    # episodes were context-truncated yet invisible to compact filtering.
+    inferred_termination: TerminationReason | None = None
+
     # Bad traces (missing or empty token_ids) silently corrupt loss math and
     # shrink GRPO groups; raise on real mismatches so retries can reissue.
     n_agent_steps = sum(len(t.steps) for t in episode.trajectories)
@@ -159,7 +168,12 @@ def enrich_episode_with_traces(
     if agent_populates_steps and len(training_steps) > n_agent_steps:
         extra = training_steps[n_agent_steps:]
         extras_all_malformed = all(not s.model_output.prompt_ids or not s.model_output.completion_ids for s in extra)
-        if extras_all_malformed:
+        # Token-less traces are only ANOMALOUS (context overflow) when the
+        # upstream normally returns token IDs. Against external providers
+        # (strict=False eval) every trace is token-less — inferring
+        # truncation there would mislabel whole eval runs.
+        any_tokens = any(s.model_output.prompt_ids for s in training_steps[:n_agent_steps])
+        if extras_all_malformed and (strict or any_tokens):
             logger.warning(
                 "[%s] dropping %d trailing malformed trace(s); keeping %d aligned with agent_steps",
                 uid,
@@ -167,6 +181,7 @@ def enrich_episode_with_traces(
                 n_agent_steps,
             )
             training_steps = training_steps[:n_agent_steps]
+            inferred_termination = TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED
 
     # Same rationale for flows that record no Steps at all (CLI harnesses:
     # steps are built wholesale from traces): an occasional token-less trace
@@ -182,6 +197,12 @@ def enrich_episode_with_traces(
                 len(malformed),
                 len(training_steps),
             )
+            # A malformed FINAL trace ended the episode (context overflow on
+            # the last call); mid-sequence malformed traces are transient
+            # failures the agent survived and carry no termination signal.
+            last = training_steps[-1]
+            if not last.model_output.prompt_ids or not last.model_output.completion_ids:
+                inferred_termination = TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED
             training_steps = [s for s in training_steps if s.model_output.prompt_ids and s.model_output.completion_ids]
 
     empty_prompt = sum(1 for s in training_steps if not s.model_output.prompt_ids)
@@ -246,6 +267,14 @@ def enrich_episode_with_traces(
             )
         ]
 
+    # A final completion cut by the per-call token cap (finish_reason
+    # "length") also ends CLI-harness episodes: the agent can't parse the
+    # cut response and gives up. Label it so compact filtering can mask.
+    if inferred_termination is None and training_steps:
+        final_finish = getattr(training_steps[-1].model_output, "finish_reason", None)
+        if final_finish == "length":
+            inferred_termination = TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED
+
     # Compute metrics
     metrics = compute_step_metrics(enriched_trajectories)
     metrics["empty"] = int(len(traces) == 0)
@@ -259,7 +288,7 @@ def enrich_episode_with_traces(
         trajectories=enriched_trajectories,
         metrics=metrics,
         metadata=episode.metadata,
-        termination_reason=episode.termination_reason,
+        termination_reason=episode.termination_reason or inferred_termination,
         artifacts=episode.artifacts,
     )
 
@@ -730,6 +759,26 @@ class AgentFlowEngine:
         for signal in eval_output.signals:
             enriched.metrics[signal.name] = signal.value
 
+        # Cap-hit labeling for CLI-harness flows, which never raise
+        # TerminationEvent themselves. Precedence: enrichment-inferred
+        # context/length truncation (already on the episode) > turn cap >
+        # wall-clock timeout > ENV_DONE default. Env vars mirror the harness
+        # knobs so no config plumbing is needed (RLLM_* reaches Ray actors).
+        if enriched.termination_reason is None:
+            max_turns = env_int("RLLM_AGENT_MAX_TURNS", 0)
+            # Count ENRICHED steps, not raw traces: failed model-call retries
+            # (vLLM 400/500 bodies) persist token-less traces that enrichment
+            # drops — raw trace counts would mislabel a legitimate submit
+            # preceded by a few retries as a cap hit.
+            n_steps = sum(len(t.steps) for t in enriched.trajectories)
+            if max_turns > 0 and n_steps >= max_turns:
+                enriched.termination_reason = TerminationReason.MAX_TURNS_EXCEEDED
+        if enriched.termination_reason is None and _timings is not None:
+            # The harness's effective timeout is per-task metadata with the
+            # env knob as fallback (cli_harness.run).
+            run_timeout = float(task_obj.metadata.get("agent_timeout", env_int("RLLM_HARNESS_RUN_TIMEOUT_S", 1800)))
+            if _timings.get("time/agentflow_s", 0.0) >= 0.98 * run_timeout:
+                enriched.termination_reason = TerminationReason.TIMEOUT
         if enriched.termination_reason is None:
             enriched.termination_reason = TerminationReason.ENV_DONE
         return enriched

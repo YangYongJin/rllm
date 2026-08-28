@@ -5,7 +5,13 @@ import numpy as np
 
 def calculate_grpo_advantages_per_group(rewards: np.ndarray, norm_adv_by_std_in_grpo=True, episilon=1e-6) -> tuple[np.ndarray, np.ndarray]:
     if len(rewards) <= 1:
-        group_mean, group_std = 0.0, 1.0
+        # A lone rollout has no group baseline. The old (mean=0, std=1) rule
+        # passed its raw reward through as advantage, so a single surviving
+        # success trained with an uncentered +1 — pure positive reinforcement
+        # of whatever that survivor did whenever an upstream filter shrank a
+        # group to one member.
+        advantages = np.zeros_like(np.asarray(rewards, dtype=np.float64))
+        return advantages, advantages
     else:
         group_mean = np.mean(rewards)
         group_std = np.std(rewards)

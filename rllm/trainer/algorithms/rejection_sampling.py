@@ -24,6 +24,7 @@ class RejectionSamplingMetrics:
     groups_before_filter: int = 0
     groups_after_filter: int = 0
     groups_dropped_insufficient_trajs: int = 0
+    groups_dropped_uniform_reward: int = 0
 
     def reset(self):
         """Reset all metrics to zero."""
@@ -33,6 +34,7 @@ class RejectionSamplingMetrics:
         self.groups_before_filter = 0
         self.groups_after_filter = 0
         self.groups_dropped_insufficient_trajs = 0
+        self.groups_dropped_uniform_reward = 0
 
     def to_dict(self, prefix: str = "batch/") -> dict:
         """Convert metrics to a dictionary for logging."""
@@ -46,6 +48,7 @@ class RejectionSamplingMetrics:
             f"{prefix}groups_before_filter": self.groups_before_filter,
             f"{prefix}groups_after_filter": self.groups_after_filter,
             f"{prefix}groups_dropped_insufficient_trajs": self.groups_dropped_insufficient_trajs,
+            f"{prefix}groups_dropped_uniform_reward": self.groups_dropped_uniform_reward,
         }
 
 
@@ -129,6 +132,22 @@ def filter_groups(
             dropped.append(group)
             continue
 
+        # Uniform-reward groups (all-pass / all-fail) center to zero
+        # advantage and contribute no policy gradient, but their tokens
+        # still dilute token-mean loss aggregation and burn update FLOPs.
+        # DAPO-style dynamic sampling drops them; honoured independently of
+        # ``rejection_sample.enable`` (same contract as the async buffer).
+        # GRPO-centric: with a group-relative estimator uniform reward ⇒
+        # zero advantage. Do NOT combine with REINFORCE/batch-centered
+        # estimators, where a uniform all-success group still carries
+        # nonzero advantage (the async buffer filters post-estimator).
+        if config.filter_uniform_groups:
+            rewards = [traj.reward for traj in group.trajectories]
+            if all(r is not None for r in rewards) and max(rewards) - min(rewards) < 1e-8:
+                metrics.groups_dropped_uniform_reward += 1
+                dropped.append(group)
+                continue
+
         filtered.append(group)
 
     metrics.groups_after_filter += len(filtered)
@@ -183,12 +202,15 @@ def apply_rejection_sampling_and_filtering(
 
     metrics = state.metrics
 
-    # Step 1: Filter groups and episodes based on config
+    # Step 1: Compute episode-level correctness metrics on the PRE-filter
+    # episodes ("always, for logging"): with binary rewards, uniform groups
+    # ARE the solve_none/solve_all tasks — computing after the uniform drop
+    # would report solve_partial ≈ 1.0 and erase the difficulty signal.
+    update_episode_metrics(episodes, metrics)
+
+    # Step 2: Filter groups and episodes based on config
     filtered_groups, dropped_groups = filter_groups(groups, config, metrics)
     filtered_episodes = filter_episodes(episodes, dropped_groups)
-
-    # Step 2: Compute episode-level correctness metrics (always, for logging)
-    update_episode_metrics(filtered_episodes, metrics)
 
     # Step 3: Apply mode-specific logic (TODO(listar2000): implement a group-level rejection sampling)
     if config.mode == "none":
