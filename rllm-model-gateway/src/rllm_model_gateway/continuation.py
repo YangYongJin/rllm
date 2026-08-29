@@ -168,6 +168,10 @@ class ContinuationController:
         # v3-M3: per-task solve rates beat per-repo ones (within-repo variance
         # is what decides a group's fate). Falls back repo -> global prior.
         self._task_rates: dict[str, float] = {}
+        # Evidence counts behind each rate: the threshold rule's b(x)/p_hat
+        # blend weights by observed attempts (2026-08-29 signal audit: b(x)
+        # carries nearly all outcome signal in the healthy regime).
+        self._task_counts: dict[str, float] = {}
         if task_rates_path:
             try:
                 with open(task_rates_path) as fh:
@@ -176,9 +180,17 @@ class ContinuationController:
                     n = float(v.get("attempts", 0) or 0)
                     if n > 0:
                         self._task_rates[k] = float(v.get("solves", 0) or 0) / n
+                        self._task_counts[k] = n
                 logger.info("loaded %d task solve rates from %s", len(self._task_rates), task_rates_path)
             except Exception:
                 logger.exception("could not load task rates from %s", task_rates_path)
+        # Hot-reloadable runtime overrides (cold-start/online mode): a JSON
+        # file {enabled, tau, temperature} checked by mtime each turn, so a
+        # driver-side bootstrap can activate stopping mid-run once its head
+        # is fitted and validated — no env change or restart needed.
+        self._overrides_path = os.environ.get("RLLM_CONTROLLER_OVERRIDES") or None
+        self._overrides_mtime = 0.0
+        self._enabled_override = True
         self._head = None
         self._head_path = head_path
         self._head_mtime = 0.0
@@ -382,6 +394,62 @@ class ContinuationController:
         z = max(-30.0, min(30.0, (score - self.tau) / max(self.temperature, 1e-6)))
         return self.p_min + (1.0 - self.p_min) * (1.0 / (1.0 + math.exp(-z)))
 
+    def _maybe_reload_overrides(self) -> None:
+        if not self._overrides_path:
+            return
+        try:
+            mtime = os.path.getmtime(self._overrides_path)
+        except OSError:
+            return
+        if mtime <= self._overrides_mtime:
+            return
+        self._overrides_mtime = mtime
+        try:
+            with open(self._overrides_path) as fh:
+                ov = json.load(fh)
+            if "tau" in ov:
+                self.tau = float(ov["tau"])
+            if "temperature" in ov:
+                self.temperature = float(ov["temperature"])
+            self._enabled_override = bool(ov.get("enabled", True))
+            logger.info("controller overrides reloaded: enabled=%s tau=%.4f temp=%.4f",
+                        self._enabled_override, self.tau, self.temperature)
+        except Exception:
+            logger.exception("could not load controller overrides from %s", self._overrides_path)
+
+    def _blended_score(self, st: dict[str, Any], session_id: str, repo: str) -> float:
+        """Evidence-weighted blend of the task solve-rate prior and the head.
+
+        The 2026-08-29 signal audit: in the healthy regime b(x) is the
+        dominant predictor (episode AUC ~0.9) and prefix features add little;
+        weight b(x) by how much evidence backs it (attempts n, half-weight at
+        n=4) so unseen tasks fall back to the head + repo prior.
+        """
+        p_hat = self._p_hat(st)
+        task = self._group_key(session_id).split("/")[-1]
+        b = self._base_rate(session_id, repo)
+        n = self._task_counts.get(task, 0.0)
+        w = n / (n + 4.0)
+        return w * b + (1.0 - w) * p_hat
+
+    def _continue_prob_threshold(self, st: dict[str, Any], session_id: str) -> float:
+        """First-crossing threshold rule (v4, from the 2026-08-29 audit).
+
+        The ratio rule's score dU/C is degenerate in the healthy regime
+        (compressed p_hat flattens dU; the cost denominator supplies ~all
+        variance and preferentially kills the YOUNGEST rollouts, where
+        prediction is weakest). Validated replacement: stop when the blended
+        success estimate crosses tau (theta) at t >= min_turns (>= ~10 —
+        earlier turns carry no signal, AUC .49-.53). Sigmoid at small
+        temperature keeps the propensity accounting exact while approximating
+        a hard first-crossing. Group floor still applies; the dU contrast
+        guard is ratio-rule-specific and inert here.
+        """
+        repo = st.get("repo", "unknown")
+        score = self._blended_score(st, session_id, repo)
+        z = max(-30.0, min(30.0, (score - self.tau) / max(self.temperature, 1e-6)))
+        return self.p_min + (1.0 - self.p_min) * (1.0 / (1.0 + math.exp(-z)))
+
     def _continue_prob(self, st: dict[str, Any]) -> float:
         if self.mode == "random" or self._head is None:
             return 1.0 - self.p_stop
@@ -412,6 +480,7 @@ class ContinuationController:
         if session_id.endswith(":val"):
             return None
         self._maybe_reload_head()
+        self._maybe_reload_overrides()
         st = self._session(session_id)
         st["turn"] += 1
         turn = st["turn"]
@@ -427,9 +496,15 @@ class ContinuationController:
             gk_reg = self._group_key(session_id)
             with self._lock:
                 self._group_p.setdefault(gk_reg, {})[session_id] = self._p_hat(st)
+        elif self.rule == "threshold" and self.mode == "learned" and self._head is not None:
+            s_t = self._continue_prob_threshold(st, session_id)
         else:
             s_t = self._continue_prob(st)
-        eligible = turn > self.min_turns and not st["stopped"]
+        # Cold-start pass-through: with overrides disabled, features and
+        # online stats keep accruing but no rollout is ever stopped, and the
+        # decision is logged with eligible=false so the propensity product
+        # stays exactly 1 for this phase.
+        eligible = turn > self.min_turns and not st["stopped"] and self._enabled_override
         sampled_continue = True
         if eligible:
             sampled_continue = self._rng.random() < s_t
