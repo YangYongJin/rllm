@@ -191,6 +191,15 @@ class ContinuationController:
         self._overrides_path = os.environ.get("RLLM_CONTROLLER_OVERRIDES") or None
         self._overrides_mtime = 0.0
         self._enabled_override = True
+        # Task rates are also hot-reloadable (cold-start bootstrap writes them
+        # mid-run from the run's own episodes).
+        self._task_rates_path = task_rates_path
+        self._task_rates_mtime = 0.0
+        if task_rates_path:
+            try:
+                self._task_rates_mtime = os.path.getmtime(task_rates_path)
+            except OSError:
+                pass
         self._head = None
         self._head_path = head_path
         self._head_mtime = 0.0
@@ -394,7 +403,34 @@ class ContinuationController:
         z = max(-30.0, min(30.0, (score - self.tau) / max(self.temperature, 1e-6)))
         return self.p_min + (1.0 - self.p_min) * (1.0 / (1.0 + math.exp(-z)))
 
+    def _maybe_reload_task_rates(self) -> None:
+        if not self._task_rates_path:
+            return
+        try:
+            mtime = os.path.getmtime(self._task_rates_path)
+        except OSError:
+            return
+        if mtime <= self._task_rates_mtime:
+            return
+        self._task_rates_mtime = mtime
+        try:
+            with open(self._task_rates_path) as fh:
+                raw = json.load(fh)
+            rates, counts = {}, {}
+            for k, v in raw.items():
+                n = float(v.get("attempts", 0) or 0)
+                if n > 0:
+                    rates[k] = float(v.get("solves", 0) or 0) / n
+                    counts[k] = n
+            with self._lock:
+                self._task_rates = rates
+                self._task_counts = counts
+            logger.info("task solve rates hot-reloaded: %d tasks", len(rates))
+        except Exception:
+            logger.exception("could not hot-reload task rates from %s", self._task_rates_path)
+
     def _maybe_reload_overrides(self) -> None:
+        self._maybe_reload_task_rates()
         if not self._overrides_path:
             return
         try:
