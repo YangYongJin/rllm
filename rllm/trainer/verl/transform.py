@@ -375,6 +375,7 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
     """
     name = trajectory.name
     trajectory_id = f"{task_id}_{name}"
+    diag = accumulated.merge_diag
     if len(trajectory.steps) == 0:
         print(f"Trajectory {trajectory_id} has no steps, skipping")
         return 0
@@ -408,10 +409,38 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
     # that segment. ``full_seq`` tracks prompt+all-action-and-obs tokens
     # so we can detect prefix-extension on the next step.
 
+    def _check_logprob_contract(action, action_lp):
+        """Tripwire: a step's rollout log-probs must be 1:1 with its completion.
+
+        A short vector is zero-filled below (log-prob 0.0 == probability 1.0,
+        never a legitimate value) and, inside a merged row, shifts every later
+        token's log-prob; an EMPTY vector contributes nothing at all while the
+        response still grows, shifting the whole remainder of the row. Both
+        pass the row-count guard in ``_batch_tensors_and_build_data_proto``
+        silently, so they are counted and shouted about here rather than
+        corrected. ``rllm/types.py`` asserts this for non-empty vectors at
+        ``Step`` construction; the empty case is only caught here.
+        """
+        diag["steps_total"] = diag.get("steps_total", 0) + 1
+        if not action_lp:
+            if action:
+                diag["steps_empty_logprobs"] = diag.get("steps_empty_logprobs", 0) + 1
+        elif len(action_lp) != len(action):
+            diag["steps_logprob_len_mismatch"] = diag.get("steps_logprob_len_mismatch", 0) + 1
+            logger.error(
+                "ROLLOUT LOGPROB LENGTH MISMATCH in %s: %d log-probs for %d completion tokens. "
+                "The vector is zero-filled, so those tokens enter the loss with rollout probability 1.0 "
+                "and every later token in this merged row is scored against the wrong log-prob.",
+                trajectory_id,
+                len(action_lp),
+                len(action),
+            )
+
     def _new_segment(step):
         prompt = list(step.model_output.prompt_ids)
         action = list(step.model_output.completion_ids)
         action_lp = list(step.model_output.logprobs or [])
+        _check_logprob_contract(action, action_lp)
         # If logprobs missing/short, pad to action length with zeros so
         # accumulator lists stay aligned. add_step skips logprobs entirely
         # when the list is empty, but we keep parity with action_tokens.
@@ -467,11 +496,13 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
     segments_emitted = 0
     for step in valid_steps[1:]:
         prompt_ids = list(step.model_output.prompt_ids)
+        diag["transitions"] = diag.get("transitions", 0) + 1
         if len(prompt_ids) >= len(seg["full_seq"]) and prompt_ids[: len(seg["full_seq"])] == seg["full_seq"]:
             # Cumulative — extend the current segment.
             delta_obs = prompt_ids[len(seg["full_seq"]) :]
             action = list(step.model_output.completion_ids)
             action_lp = list(step.model_output.logprobs or [])
+            _check_logprob_contract(action, action_lp)
             if action_lp and len(action_lp) != len(action):
                 action_lp = list(action_lp) + [0.0] * (len(action) - len(action_lp))
 
@@ -488,6 +519,33 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
                 seg["last_routing_step"] = step
         else:
             # Non-cumulative — close out current segment, start a new one.
+            #
+            # Tripwire. A break means turn k+1's prompt is NOT an extension of
+            # turn k's prompt+action: the scaffold or the chat template
+            # re-rendered the conversation so that tokens the rollout actually
+            # emitted are no longer present in the history it produced. Rows
+            # stay individually correct (each is a real vLLM prompt/completion
+            # pair), so nothing is corrected here -- but the two rows are
+            # mutually inconsistent renderings of the same episode, and the
+            # divergence offset says how much of the rollout's own output was
+            # rewritten. Measured cause in the 9B baseline: the agent scaffold
+            # deletes a malformed assistant turn and injects a bare `user`
+            # correction, which moves the Qwen3.5 template's `last_query_index`
+            # and retroactively strips <think> from every earlier assistant
+            # turn (logs/second_corruption.md).
+            full_seq = seg["full_seq"]
+            n_prev = len(full_seq)
+            div = min(len(prompt_ids), n_prev)
+            for i in range(div):
+                if prompt_ids[i] != full_seq[i]:
+                    div = i
+                    break
+            lost = n_prev - div
+            diag["breaks"] = diag.get("breaks", 0) + 1
+            diag["break_div_frac_sum"] = diag.get("break_div_frac_sum", 0.0) + (div / n_prev if n_prev else 0.0)
+            diag["break_lost_sum"] = diag.get("break_lost_sum", 0) + lost
+            diag["break_lost_max"] = max(diag.get("break_lost_max", 0), lost)
+
             _emit(seg)
             segments_emitted += 1
             seg = _new_segment(step)
@@ -572,6 +630,24 @@ def _compute_merge_metrics(accumulated: AccumulatedData, total_agent_steps: int)
     - batch/merge_compression_ratio: total agent steps ÷ total emitted
       rows. =N for a fully cumulative N-turn batch; =1 means no merging
       occurred (per-step rows, or all single-step trajectories).
+
+    Tripwire metrics (see ``_process_trajectory``). ``steps_per_traj`` says
+    THAT the merge broke; these say WHERE and HOW BADLY, which is what
+    distinguishes "the scaffold rewrote history" from "a whitespace round-trip
+    drifted by one token":
+
+    - batch/merge_break_rate: fraction of turn transitions where turn k+1's
+      prompt was not an extension of turn k's prompt+action. 0.0 is healthy.
+    - batch/merge_break_divergence_frac/mean: where the re-render first
+      differs, as a fraction of the previous sequence. ~1.0 = only the last
+      turn changed (a local rewrite); ~0.1 = the conversation was rewritten
+      almost from the top (retroactive <think> stripping).
+    - batch/merge_break_lost_tokens/{mean,max}: how many tokens of the
+      rollout's own output the re-render replaced.
+    - batch/steps_with_empty_logprobs, batch/steps_with_logprob_len_mismatch:
+      violations of the rollout-logprob length contract. Both must be 0; a
+      non-zero value means some trained tokens carry a fabricated rollout
+      probability of 1.0 and every later token in that row is misaligned.
     """
     if not accumulated.responses:
         return {}
@@ -591,7 +667,32 @@ def _compute_merge_metrics(accumulated: AccumulatedData, total_agent_steps: int)
             action_token_ratios.append(float(mask.sum().item()) / n)
     total_emitted_rows = len(accumulated.responses)
 
+    diag = accumulated.merge_diag
+    n_trans = diag.get("transitions", 0)
+    n_breaks = diag.get("breaks", 0)
+    n_empty_lp = diag.get("steps_empty_logprobs", 0)
+    n_bad_lp = diag.get("steps_logprob_len_mismatch", 0)
+    if n_empty_lp:
+        logger.error(
+            "ROLLOUT LOGPROB CONTRACT: %d/%d agent steps returned NO log-probs while returning completion "
+            "tokens. Those steps contribute tokens but no log-probs, so every later token in their merged "
+            "row is scored against a shifted rollout log-prob vector.",
+            n_empty_lp,
+            diag.get("steps_total", 0),
+        )
+    tripwires = {
+        "batch/merge_break_rate": (n_breaks / n_trans) if n_trans else 0.0,
+        "batch/merge_breaks/total": n_breaks,
+        "batch/steps_with_empty_logprobs": n_empty_lp,
+        "batch/steps_with_logprob_len_mismatch": n_bad_lp,
+    }
+    if n_breaks:
+        tripwires["batch/merge_break_divergence_frac/mean"] = diag.get("break_div_frac_sum", 0.0) / n_breaks
+        tripwires["batch/merge_break_lost_tokens/mean"] = diag.get("break_lost_sum", 0) / n_breaks
+        tripwires["batch/merge_break_lost_tokens/max"] = int(diag.get("break_lost_max", 0))
+
     return {
+        **tripwires,
         "batch/steps_per_traj/mean": float(_np.mean(rows_per_traj)),
         "batch/steps_per_traj/min": int(_np.min(rows_per_traj)),
         "batch/steps_per_traj/max": int(_np.max(rows_per_traj)),

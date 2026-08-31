@@ -70,6 +70,17 @@ class AccumulatedData:
     # Each entry is shape (response_len, num_layers, topk).
     routing_matrices: list[torch.Tensor] = field(default_factory=list)
 
+    # Tripwire counters for the two invariants the merge silently depends on
+    # (populated by ``_process_trajectory``, read by ``_compute_merge_metrics``):
+    #   * the prefix-extension invariant -- turn k+1's prompt must begin with
+    #     turn k's prompt+action, or the conversation was re-rendered and the
+    #     rollout's own output no longer appears in the history it produced;
+    #   * the rollout-logprob length contract -- a step's logprob vector must
+    #     be exactly as long as its completion, or every later token in the
+    #     merged row is scored against the wrong log-prob.
+    # Not parallel to the tensor lists; a plain counter bag.
+    merge_diag: dict = field(default_factory=dict)
+
     def add_step(
         self,
         step_data: ProcessedStepData,
