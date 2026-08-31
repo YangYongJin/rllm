@@ -8,6 +8,7 @@ __all__ = [
     "transform_episodes_to_dataproto",
     "transform_trajectory_groups_to_dataproto",
     "update_dataproto_with_advantages",
+    "resolve_training_row_window",
     # dataclass
     "AccumulatedData",
     "ProcessedStepData",
@@ -23,6 +24,7 @@ def __getattr__(name):
         "transform_episodes_to_dataproto",
         "transform_trajectory_groups_to_dataproto",
         "update_dataproto_with_advantages",
+        "resolve_training_row_window",
     }:
         from . import transform as _t
 

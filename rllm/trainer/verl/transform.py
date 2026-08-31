@@ -16,6 +16,30 @@ from rllm.workflows.workflow import TerminationReason
 logger = logging.getLogger(__name__)
 
 
+def resolve_training_row_window(config) -> int:
+    """Token budget for ONE training row (prompt + response tokens).
+
+    ``data.max_prompt_length`` is a *rollout-time, per-call* cap: exceeding it
+    raises ``MAX_PROMPT_LENGTH_EXCEEDED`` and ends the episode
+    (``rllm/engine/rollout/verl_engine.py``). It is **not** a bound on a
+    training row's prompt. ``_process_trajectory`` merges a multi-turn
+    trajectory into rows whose prompt is the *entire conversation prefix* at
+    the point the prefix-merge had to restart, so a row's prompt is bounded
+    only by the inference engine's context window. Sizing the prompt window
+    with ``data.max_prompt_length`` silently deleted the head of every
+    over-long row (system prompt, ``<tools>`` schema, task statement).
+    """
+    total = int(config.data.max_prompt_length) + int(config.data.max_response_length)
+    ctx = None
+    try:
+        ctx = config.actor_rollout_ref.rollout.get("max_model_len", None)
+    except Exception:  # config subtree absent (non-verl callers)
+        ctx = None
+    if ctx:
+        total = max(total, int(ctx))
+    return total
+
+
 def _pad_sequence_batch(sequences: list[torch.Tensor], pad_token_id: int, max_length: int, left_pad: bool = True) -> torch.Tensor:
     """Pads a list of sequences to a maximum length.
 
@@ -27,6 +51,16 @@ def _pad_sequence_batch(sequences: list[torch.Tensor], pad_token_id: int, max_le
     Returns:
         torch.Tensor: The padded sequences.
     """
+    # Truncate PER SEQUENCE, always keeping the head. The previous tensor-level
+    # `batch[:, -max_length:]` for left-padded prompts kept the *tail* of every
+    # over-long row and deleted its head; a row-wise head slice is impossible at
+    # tensor level because each row has a different left-pad offset.
+    # Head-truncating a prompt still breaks the prompt->response join, so callers
+    # additionally zero the loss mask of over-long rows (see
+    # `_batch_tensors_and_build_data_proto`); this path is a tripwire, not a
+    # routine trim.
+    sequences = [seq[:max_length] if seq.shape[0] > max_length else seq for seq in sequences]
+
     if left_pad:
         rev_sequences = [torch.flip(seq, dims=[0]) for seq in sequences]
         batch = torch.nn.utils.rnn.pad_sequence(rev_sequences, batch_first=True, padding_value=pad_token_id).flip(dims=[1])
@@ -34,8 +68,6 @@ def _pad_sequence_batch(sequences: list[torch.Tensor], pad_token_id: int, max_le
         batch = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=pad_token_id)
 
     batch = pad_sequence_to_length(batch, max_length, pad_token_id, left_pad=left_pad)
-    # additional truncation check
-    batch = batch[:, -max_length:] if left_pad else batch[:, :max_length]
     return batch
 
 
@@ -145,6 +177,8 @@ def _batch_tensors_and_build_data_proto(accumulated: AccumulatedData, pad_token_
     Returns:
         DataProto: The DataProto built from the AccumulatedData.
     """
+    window_metrics = _detect_window_overflow(accumulated, max_prompt_length, max_response_length)
+
     prompts_batch = _pad_sequence_batch(accumulated.prompts, pad_token_id, max_prompt_length, left_pad=True)  # shape: [bs, max_prompt_length]
     responses_batch = _pad_sequence_batch(accumulated.responses, pad_token_id, max_response_length, left_pad=False)  # shape: [bs, max_response_length]
     input_ids = torch.concat([prompts_batch, responses_batch], dim=1)  # shape: [bs, max_prompt_length + max_response_length]
@@ -165,6 +199,14 @@ def _batch_tensors_and_build_data_proto(accumulated: AccumulatedData, pad_token_
         position_ids = (torch.cumsum(attention_mask, dim=1) - 1) * attention_mask  # shape: [bs, max_prompt_length + max_response_length]
 
     traj_mask = _pad_sequence_batch(accumulated.traj_mask, 0, max_response_length, left_pad=False)  # shape: [bs, max_response_length]
+
+    # A head-truncated prompt no longer joins onto its response, so the row's
+    # log-probs are computed against a context the sampler never saw. Contribute
+    # zero gradient rather than train on it (verl's token-mean normaliser
+    # recomputes over the surviving mask, so this does not dilute other rows).
+    overflow_rows = window_metrics.pop("_prompt_overflow_indices")
+    if overflow_rows:
+        traj_mask[overflow_rows] = 0
 
     step_rewards_batch, traj_rewards_batch = _build_step_and_trajectory_rewards(
         accumulated.step_rewards, accumulated.traj_rewards, responses_batch, accumulated.responses
@@ -230,8 +272,61 @@ def _batch_tensors_and_build_data_proto(accumulated: AccumulatedData, pad_token_
         non_tensors=non_tensors,
         meta_info={
             "repeat_counts": accumulated.repeat_counts,
+            "merge_metrics": window_metrics,
         },
     )
+
+
+def _detect_window_overflow(accumulated: AccumulatedData, max_prompt_length: int, max_response_length: int) -> dict:
+    """Count rows that do not fit the prompt/response windows, and shout if any do not.
+
+    Prompt overflow is a correctness bug, not a trim: the row's prompt would lose
+    its head (system prompt, ``<tools>`` schema, task statement) and its response
+    would then be conditioned on a context that never existed. It was silent for
+    an entire training run; it is loud now.
+
+    Returns a metrics dict plus ``_prompt_overflow_indices`` (popped by the
+    caller) listing the rows to zero-weight.
+    """
+    prompt_lens = [int(p.shape[0]) for p in accumulated.prompts]
+    response_lens = [int(r.shape[0]) for r in accumulated.responses]
+    n_rows = len(prompt_lens)
+    if n_rows == 0:
+        return {"_prompt_overflow_indices": []}
+
+    overflow_idx = [i for i, n in enumerate(prompt_lens) if n > max_prompt_length]
+    n_resp_overflow = sum(1 for n in response_lens if n > max_response_length)
+
+    if overflow_idx:
+        logger.error(
+            "PROMPT WINDOW OVERFLOW: %d/%d training rows (%.1f%%) have a prompt longer than the "
+            "prompt window (%d tokens); longest is %d. Head-truncating these would delete the system "
+            "prompt, the <tools> schema and the task statement, so they are zero-weighted instead. "
+            "Widen the window (see resolve_training_row_window / VerlBackend.transform_to_backend_batch).",
+            len(overflow_idx),
+            n_rows,
+            100.0 * len(overflow_idx) / n_rows,
+            max_prompt_length,
+            max(prompt_lens),
+        )
+    if n_resp_overflow:
+        logger.warning(
+            "RESPONSE WINDOW OVERFLOW: %d/%d training rows have a response longer than the response window (%d); longest is %d. Tail-truncated (head preserved).",
+            n_resp_overflow,
+            n_rows,
+            max_response_length,
+            max(response_lens),
+        )
+
+    return {
+        "batch/row_prompt_length/mean": float(np.mean(prompt_lens)),
+        "batch/row_prompt_length/max": int(max(prompt_lens)),
+        "batch/prompt_overflow_rows": len(overflow_idx),
+        "batch/prompt_overflow_ratio": len(overflow_idx) / n_rows,
+        "batch/response_overflow_rows": n_resp_overflow,
+        "batch/row_total_length/max": int(max(p + r for p, r in zip(prompt_lens, response_lens, strict=True))),
+        "_prompt_overflow_indices": overflow_idx,
+    }
 
 
 def _decode_routing_matrices(encoded: list[str] | None) -> torch.Tensor | None:
@@ -545,7 +640,7 @@ def transform_episodes_to_dataproto(
     assert hasattr(tokenizer, "pad_token_id"), "Tokenizer must have a pad token ID"
     pad_token_id = tokenizer.pad_token_id
     batch = _batch_tensors_and_build_data_proto(accumulated, pad_token_id, max_prompt_length, max_response_length, processor)
-    batch.meta_info["merge_metrics"] = _compute_merge_metrics(accumulated, total_agent_steps)
+    batch.meta_info["merge_metrics"].update(_compute_merge_metrics(accumulated, total_agent_steps))
     return batch
 
 

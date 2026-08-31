@@ -274,7 +274,14 @@ class AgentWorkflowEngine:
             else:
                 remaining_episodes.append(episode)
 
-        return transform_episodes_to_dataproto(remaining_episodes, self.rollout_engine, self.config.data.max_prompt_length, self.config.data.max_response_length)
+        # Both windows are the row-level context budget, not the rollout-time
+        # per-call caps: a prefix-merge break emits rows whose prompt is the
+        # whole conversation prefix, and merged responses concatenate
+        # [A0, obs1, A1, ...]. See resolve_training_row_window.
+        from rllm.trainer.verl.transform import resolve_training_row_window
+
+        row_window = resolve_training_row_window(self.config)
+        return transform_episodes_to_dataproto(remaining_episodes, self.rollout_engine, row_window, row_window)
 
     def shutdown(self):
         """Shutdown the workflow engine and cleanup resources."""

@@ -37,7 +37,7 @@ from rllm.trainer.algorithms import (
     simple_timer,
 )
 from rllm.trainer.backend_protocol import BackendProtocol
-from rllm.trainer.verl import transform_episodes_to_dataproto, transform_trajectory_groups_to_dataproto, update_dataproto_with_advantages
+from rllm.trainer.verl import resolve_training_row_window, transform_episodes_to_dataproto, transform_trajectory_groups_to_dataproto, update_dataproto_with_advantages
 from rllm.trainer.verl.metrics import calculate_debug_metrics_compat
 from rllm.trainer.verl.utils import (
     balance_batch,
@@ -440,12 +440,18 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         ``trajectory_groups``.
         """
         assert self.rollout_engine is not None, "rollout_engine is not initialized."
-        max_prompt_length = self.config.data.max_prompt_length
+        # Both windows are the full context window, for the same reason.
         # data.max_response_length is the per-turn generation cap at rollout
         # time, but merged multi-turn responses concatenate [A0, obs1, A1, ...]
-        # and can grow up to the full context window - so use max_total_length to
-        # bound the sequence.
-        max_total_length = max_prompt_length + self.config.data.max_response_length
+        # and can grow up to the full context window. Symmetrically,
+        # data.max_prompt_length is the per-call prompt cap at rollout time,
+        # but a row emitted after a prefix-merge break starts mid-conversation
+        # and its prompt is the whole conversation prefix. Rollout already
+        # bounded prompt+response by the context window, so this window can
+        # never truncate - and if it ever does, the transform shouts and
+        # zero-weights the row instead of silently deleting the prompt head.
+        max_total_length = resolve_training_row_window(self.config)
+        max_prompt_length = max_total_length
 
         if trainer_state.episodes is not None:
             batch = transform_episodes_to_dataproto(trainer_state.episodes, self.rollout_engine, max_prompt_length, max_total_length)
@@ -460,6 +466,9 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
 
         assert trainer_state.trajectory_groups is not None, "Either episodes or trajectory_groups must be set"
         batch = transform_trajectory_groups_to_dataproto(trainer_state.trajectory_groups, self.rollout_engine, max_prompt_length, max_total_length)
+        window_metrics = batch.meta_info.pop("merge_metrics", None)
+        if window_metrics:
+            trainer_state.metrics.update(window_metrics)
         mode = self.algorithm_config.stepwise_advantage_mode if self.algorithm_config is not None else "broadcast"
         return update_dataproto_with_advantages(batch, trainer_state.trajectory_groups, mode=mode)
 
