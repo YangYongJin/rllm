@@ -122,6 +122,9 @@ class ChatTemplateParser:
             elif "kimi-k2" in model_name:
                 logger.info(f"Using KimiK2ThinkingChatTemplateParser for {tokenizer.name_or_path}")
                 return KimiK2ThinkingChatTemplateParser(tokenizer)
+            elif "gemma-3" in model_name or "gemma3" in model_name:
+                logger.info(f"Using Gemma3ChatTemplateParser for {tokenizer.name_or_path}")
+                return Gemma3ChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
             elif "gemma" in model_name or "gemma" in tokenizer_cls:
                 logger.info(f"Using GemmaChatTemplateParser for {tokenizer.name_or_path}")
                 return GemmaChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
@@ -1184,3 +1187,89 @@ class GemmaChatTemplateParser(ChatTemplateParser):
         else:
             reasoning, content = "", body
         return {"content": content, "reasoning": reasoning, "tool_calls": []}
+
+
+class Gemma3ChatTemplateParser(ChatTemplateParser):
+    """Gemma 3 chat markup (``google/gemma-3-*-it``), hand-rolled like ``QwenChatTemplateParser`` so that
+    multi-turn token loops can append turns without re-rendering.
+
+    Byte-identical to the checkpoint's ``chat_template.jinja`` for system / user / assistant messages::
+
+        <bos><start_of_turn>user\n[{system}\n\n]{user | trim}<end_of_turn>\n<start_of_turn>model\n
+
+    * ``<bos>`` once, only when ``is_first_msg``;
+    * there is NO system turn: a leading system message becomes the prefix ``{system}\n\n`` (not trimmed, exactly
+      as the template's ``first_user_prefix``) of the first turn after it, whatever its role;
+    * every turn's content is ``trim``-med; the assistant role renders as ``model``;
+    * Gemma 3 has no thinking channel: ``disable_thinking`` is accepted for the factory's sake and ignored, and
+      ``parse_completion`` returns the whole body as content;
+    * the model ends a turn with ``<end_of_turn>`` (id 106, the tokenizer's ``eos_token``; ``<eos>`` is 1), so
+      ``eot_token`` is ``"<end_of_turn>\n"`` and ``stop_sequences`` is ``[<end_of_turn>, <eos>]``.
+    Tool declarations / tool messages are not part of the template: ``tools`` raises.
+    """
+
+    def __init__(self, tokenizer, processor=None, disable_thinking=False):
+        super().__init__(tokenizer, processor=processor)
+        self.disable_thinking = disable_thinking
+        self.bos_token = tokenizer.bos_token or "<bos>"
+        self.eos_token = "<eos>"
+        self.end_of_turn = "<end_of_turn>"
+        self.eot_token = self.end_of_turn + "\n"
+        self.user_token = "<start_of_turn>user\n"
+        self.assistant_token = "<start_of_turn>model\n"
+        self.generation_prompt = self.assistant_token
+        end_of_turn = tokenizer.convert_tokens_to_ids(self.end_of_turn)
+        eos = tokenizer.convert_tokens_to_ids(self.eos_token)
+        self.stop_sequences = [i for i in (end_of_turn, eos) if isinstance(i, int) and i >= 0 and i != tokenizer.unk_token_id]
+
+    def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list | None = None, accumulate_reasoning: bool = False, **kwargs) -> str:
+        if tools:
+            raise NotImplementedError("Gemma3ChatTemplateParser does not render tool declarations")
+        result = self.bos_token if is_first_msg else ""
+        msgs = list(messages)
+        prefix = ""
+        if msgs and msgs[0]["role"] == "system":
+            prefix = self._text(msgs[0]) + "\n\n"
+            msgs = msgs[1:]
+        for i, message in enumerate(msgs):
+            role = message["role"]
+            first = prefix if i == 0 else ""
+            if role == "user":
+                result += self.user_token + first + self._text(message).strip() + self.eot_token
+            elif role == "assistant":
+                result += self.assistant_token + first + self._text(message).strip() + self.eot_token
+            elif role == "system":
+                raise ValueError("Gemma 3 templates accept a system message only as the first message")
+            else:
+                raise NotImplementedError(f"Unsupported message role: {role}")
+        if add_generation_prompt:
+            result += self.generation_prompt
+        return result
+
+    @staticmethod
+    def _text(message) -> str:
+        content = message.get("content", None) or ""
+        if isinstance(content, list):  # content parts
+            content = "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        return str(content)
+
+    def parse_system(self, message):
+        # the template has no system turn; ``parse`` folds it into the next turn
+        raise NotImplementedError("Gemma 3 has no system turn; a system message is a prefix of the first user turn")
+
+    def parse_user(self, message):
+        return self.user_token + self._text(message).strip() + self.eot_token
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        return self.assistant_token + self._text(message).strip() + self.eot_token
+
+    def _strip_special_tokens(self, text):
+        text = text.rstrip()
+        for tail in (self.eos_token, self.end_of_turn):
+            if text.endswith(tail):
+                text = text[: -len(tail)].rstrip()
+        return text.strip()
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+        return {"content": self._strip_special_tokens(completion_text), "reasoning": "", "tool_calls": []}
