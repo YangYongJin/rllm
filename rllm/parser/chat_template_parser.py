@@ -122,6 +122,9 @@ class ChatTemplateParser:
             elif "kimi-k2" in model_name:
                 logger.info(f"Using KimiK2ThinkingChatTemplateParser for {tokenizer.name_or_path}")
                 return KimiK2ThinkingChatTemplateParser(tokenizer)
+            elif "olmo" in model_name:
+                logger.info(f"Using Olmo3ChatTemplateParser for {tokenizer.name_or_path}")
+                return Olmo3ChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
             elif "gemma-3" in model_name or "gemma3" in model_name:
                 logger.info(f"Using Gemma3ChatTemplateParser for {tokenizer.name_or_path}")
                 return Gemma3ChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
@@ -1273,3 +1276,130 @@ class Gemma3ChatTemplateParser(ChatTemplateParser):
     def parse_completion(self, completion_ids):
         completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
         return {"content": self._strip_special_tokens(completion_text), "reasoning": "", "tool_calls": []}
+
+
+class Olmo3ChatTemplateParser(ChatTemplateParser):
+    """OLMo 3 Think chat markup (``allenai/Olmo-3-*-Think``), hand-rolled like ``QwenChatTemplateParser`` so that
+    multi-turn token loops can append turns without re-rendering.
+
+    Byte-identical to the checkpoint's ``chat_template.jinja`` for system / user / assistant / environment messages::
+
+        <|im_start|>system\n{system} You do not currently have access to any functions. <functions></functions><|im_end|>\n
+        <|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>
+
+    * no BOS; nothing is trimmed;
+    * a conversation WITHOUT a system message gets the template's default OLMo system turn (rendered on
+      ``is_first_msg``, i.e. for the first render of a conversation, like the Qwen parser's injection); a system message
+      always carries the template's fixed functions suffix (`` You do not currently have access to any functions.
+      <functions></functions>``, or `` <functions>{functions}</functions>`` when the message has a ``functions`` field);
+    * an assistant turn is closed with ``<|im_end|>\n`` unless it is the LAST message, which the template closes with
+      ``eos_token`` (``<|endoftext|>``); assistant content is kept verbatim (the template does not strip ``<think>``
+      blocks from the history);
+    * the generation prompt is ``<|im_start|>assistant\n<think>``: the model's completion starts INSIDE the thinking
+      block and ends it with ``</think>``; ``parse_completion`` therefore treats a completion without ``</think>`` as
+      truncated reasoning. ``disable_thinking`` is accepted for the factory's sake and ignored (the template has no
+      switch; a Think model always reasons);
+    * the model ends a turn with ``<|im_end|>`` (id 100265; ``generation_config.eos_token_id`` is [100265, 100257]),
+      so ``eot_token`` is ``"<|im_end|>\n"`` and ``stop_sequences`` is ``[<|im_end|>, <|endoftext|>]``.
+    Tool declarations (``tools``) are not rendered: they raise.
+    """
+
+    DEFAULT_SYSTEM = ("You are OLMo, a helpful function-calling AI assistant built by Ai2. Your date cutoff is November "
+                      "2024, and your model weights are available at https://huggingface.co/allenai.")
+    NO_FUNCTIONS = " You do not currently have access to any functions. <functions></functions>"
+
+    def __init__(self, tokenizer, processor=None, disable_thinking=False):
+        super().__init__(tokenizer, processor=processor)
+        self.disable_thinking = disable_thinking
+        self.bos_token = ""
+        self.eos_token = tokenizer.eos_token or "<|endoftext|>"
+        self.im_end = "<|im_end|>"
+        self.eot_token = self.im_end + "\n"
+        self.system_token = "<|im_start|>system\n"
+        self.user_token = "<|im_start|>user\n"
+        self.assistant_token = "<|im_start|>assistant\n"
+        self.environment_token = "<|im_start|>environment\n"
+        self.think_open = "<think>"
+        self.think_close = "</think>"
+        self.generation_prompt = self.assistant_token + self.think_open
+        # OLMo's unk_token IS <|endoftext|> (= eos), so no unk filter here: keep both ids of generation_config.eos_token_id
+        ids = (tokenizer.convert_tokens_to_ids(self.im_end), tokenizer.convert_tokens_to_ids(self.eos_token))
+        self.stop_sequences = list(dict.fromkeys(i for i in ids if isinstance(i, int) and i >= 0))
+
+    @staticmethod
+    def _text(message) -> str:
+        content = message.get("content", None)
+        if content is None:
+            return ""
+        if isinstance(content, list):  # content parts
+            content = "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        return str(content)
+
+    def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list | None = None, accumulate_reasoning: bool = False, **kwargs) -> str:
+        if tools:
+            raise NotImplementedError("Olmo3ChatTemplateParser does not render tool declarations")
+        msgs = list(messages)
+        result = ""
+        if is_first_msg and not any(m["role"] == "system" for m in msgs):
+            result += self.system_token + self.DEFAULT_SYSTEM + self.NO_FUNCTIONS + self.eot_token
+        n = len(msgs)
+        for i, message in enumerate(msgs):
+            role = message["role"]
+            if role == "system":
+                result += self.parse_system(message)
+            elif role == "user":
+                result += self.parse_user(message)
+            elif role == "assistant":
+                result += self.parse_assistant(message, accumulate_reasoning=accumulate_reasoning, last=(i == n - 1))
+            elif role == "environment":
+                result += self.environment_token + self._text(message) + self.eot_token
+            else:
+                raise NotImplementedError(f"Unsupported message role: {role}")
+        if add_generation_prompt:
+            result += self.generation_prompt
+        return result
+
+    def parse_system(self, message):
+        functions = message.get("functions", None)
+        suffix = f" <functions>{functions}</functions>" if functions is not None else self.NO_FUNCTIONS
+        return self.system_token + self._text(message) + suffix + self.eot_token
+
+    def parse_user(self, message):
+        functions = message.get("functions", None)
+        suffix = f"\n<functions>{functions}</functions>" if functions is not None else ""
+        return self.user_token + self._text(message) + suffix + self.eot_token
+
+    def parse_assistant(self, message, accumulate_reasoning=False, last=False):
+        content = self._text(message)
+        reasoning = (message.get("reasoning", None) or "").strip()
+        function_calls = message.get("function_calls", None)
+        result = self.assistant_token
+        if accumulate_reasoning and reasoning:
+            result += self.think_open + "\n" + reasoning + "\n" + self.think_close + "\n\n"
+        result += content
+        if function_calls is not None:
+            result += f"<function_calls>{function_calls}</function_calls>"
+        return result + (self.eos_token if last else self.eot_token)
+
+    def _strip_special_tokens(self, text):
+        text = text.rstrip()
+        for tail in (self.eos_token, self.im_end):
+            if text.endswith(tail):
+                text = text[: -len(tail)].rstrip()
+        return text.strip()
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+        body = self._strip_special_tokens(completion_text)
+        if self.think_close in body:
+            reasoning, _, content = body.partition(self.think_close)
+            reasoning = reasoning.lstrip()
+            if reasoning.startswith(self.think_open):
+                reasoning = reasoning[len(self.think_open):]
+            reasoning, content = reasoning.strip(), content.strip()
+        else:  # the generation prompt opened the block and the model never closed it: truncated reasoning
+            reasoning = body.lstrip()
+            if reasoning.startswith(self.think_open):
+                reasoning = reasoning[len(self.think_open):]
+            reasoning, content = reasoning.strip(), ""
+        return {"content": content, "reasoning": reasoning, "tool_calls": []}

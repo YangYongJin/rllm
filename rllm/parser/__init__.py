@@ -7,6 +7,7 @@ __all__ = [
     "LlamaChatTemplateParser",
     "GemmaChatTemplateParser",
     "Gemma3ChatTemplateParser",
+    "Olmo3ChatTemplateParser",
     "ToolParser",
     "R1ToolParser",
     "QwenToolParser",
@@ -21,6 +22,7 @@ def __getattr__(name):
         "QwenChatTemplateParser",
         "GemmaChatTemplateParser",
         "Gemma3ChatTemplateParser",
+        "Olmo3ChatTemplateParser",
     }
     if name in _chat_template_classes:
         import importlib
