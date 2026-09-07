@@ -1321,7 +1321,14 @@ class Olmo3ChatTemplateParser(ChatTemplateParser):
         self.environment_token = "<|im_start|>environment\n"
         self.think_open = "<think>"
         self.think_close = "</think>"
-        self.generation_prompt = self.assistant_token + self.think_open
+        # Olmo-3-*-Think opens the thinking block in the generation prompt and appends the functions suffix to a given
+        # system message; Olmo-3-*-Instruct (no <think> anywhere in its template) renders the bare assistant head, a
+        # given system message verbatim, and a shorter default system turn. Decided by the checkpoint's template, so
+        # the Think behaviour does not depend on disable_thinking (the Think template has no switch).
+        self.instruct = "<think>" not in (getattr(tokenizer, "chat_template", None) or "")
+        if self.instruct:
+            self.DEFAULT_SYSTEM = "You are a helpful function-calling AI assistant."
+        self.generation_prompt = self.assistant_token + ("" if self.instruct else self.think_open)
         # OLMo's unk_token IS <|endoftext|> (= eos), so no unk filter here: keep both ids of generation_config.eos_token_id
         ids = (tokenizer.convert_tokens_to_ids(self.im_end), tokenizer.convert_tokens_to_ids(self.eos_token))
         self.stop_sequences = list(dict.fromkeys(i for i in ids if isinstance(i, int) and i >= 0))
@@ -1361,7 +1368,7 @@ class Olmo3ChatTemplateParser(ChatTemplateParser):
 
     def parse_system(self, message):
         functions = message.get("functions", None)
-        suffix = f" <functions>{functions}</functions>" if functions is not None else self.NO_FUNCTIONS
+        suffix = f" <functions>{functions}</functions>" if functions is not None else ("" if self.instruct else self.NO_FUNCTIONS)
         return self.system_token + self._text(message) + suffix + self.eot_token
 
     def parse_user(self, message):
