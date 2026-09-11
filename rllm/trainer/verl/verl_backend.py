@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from collections import defaultdict
 from collections.abc import Iterable
@@ -59,6 +60,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_VERL_LOSS = "vanilla"
 _VERL_KNOWN_LOSSES: set[str] | None = None
+
+
+def _create_checkpoint_manager(config, actor_wg, replicas):
+    """Bridge the CheckpointEngineManager actor_wg rename across Verl 0.8 revisions."""
+    parameter = "actor_wg" if "actor_wg" in inspect.signature(CheckpointEngineManager.__init__).parameters else "trainer"
+    return CheckpointEngineManager(config=config, replicas=replicas, **{parameter: actor_wg})
 
 
 class CustomPPOLoss:
@@ -200,10 +207,10 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         )
 
         ckpt_cfg = omega_conf_to_dataclass(config.actor_rollout_ref.rollout.checkpoint_engine)
-        self.checkpoint_manager = CheckpointEngineManager(
-            config=ckpt_cfg,
-            trainer=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
+        self.checkpoint_manager = _create_checkpoint_manager(
+            ckpt_cfg,
+            self.actor_rollout_wg,
+            self.llm_server_manager.get_replicas(),
         )
         self.checkpoint_manager.sleep_replicas()
 
@@ -277,10 +284,10 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         )
 
         ckpt_cfg = omega_conf_to_dataclass(config.actor_rollout_ref.rollout.checkpoint_engine)
-        self.checkpoint_manager = CheckpointEngineManager(
-            config=ckpt_cfg,
-            trainer=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
+        self.checkpoint_manager = _create_checkpoint_manager(
+            ckpt_cfg,
+            self.actor_rollout_wg,
+            self.llm_server_manager.get_replicas(),
         )
 
     # =========================================================================
